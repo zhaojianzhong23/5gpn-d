@@ -183,7 +183,7 @@ FINAL,direct
 
 | format | 适用 |
 |---|---|
-| `domain` | 每行一个域名（Loyalsoldier 的 `gfw.txt` / `china-list.txt`） |
+| `domain` | 每行一个域名；也吃 YAML 列表（`- 'a.com'`）和通配前缀（`+.a.com`、`||a.com^`），Loyalsoldier 的 `proxy.txt` 就是这种 |
 | `gfwlist` | base64 编码的 adblock 规则（`\|\|example.com^`） |
 | `clash` | `- DOMAIN-SUFFIX,xxx` 形式的列表，保留每条自己的类型 |
 | `dnsmasq` | `server=/baidu.com/114.114.114.114`（felixonmars/dnsmasq-china-list） |

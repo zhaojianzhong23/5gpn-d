@@ -400,6 +400,27 @@ func parseDomainList(body []byte) []string {
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "//") {
 			continue
 		}
+		// YAML 列表也吃：Loyalsoldier/clash-rules 的 proxy.txt 长这样——
+		//   payload:
+		//     - '1password.drift.click'
+		// 去掉前导 "- " 和引号，剩下就是域名。域名不可能以 "-" 开头，
+		// 所以这里不会误伤；"payload:" 这种没有点，会被 validDomain 挡掉。
+		if strings.HasPrefix(line, "-") {
+			line = strings.TrimSpace(line[1:])
+		}
+		line = strings.Trim(line, `'"`)
+		// 通配前缀：+.example.com / *.example.com / ||example.com^
+		// 这些在列表里都表示「该域名及其子域」，和 DOMAIN-SUFFIX 语义一致，
+		// 剥掉前缀即可。Loyalsoldier 的 proxy.txt 里九成五是 "+." 这种写法。
+		for _, p := range []string{"@@||", "||", "+.", "*.", "|"} {
+			if strings.HasPrefix(line, p) {
+				line = line[len(p):]
+				break
+			}
+		}
+		if i := strings.IndexAny(line, "^/"); i >= 0 {
+			line = line[:i]
+		}
 		if i := strings.IndexAny(line, " \t,"); i > 0 {
 			line = line[:i]
 		}
