@@ -211,6 +211,13 @@ func main() {
 	if len(dyn.Sources()) > 0 && len(remote) == 0 {
 		logf("info", "尚无远程规则缓存，先用本地规则启动，后台拉取中")
 	}
+	// 规则集没拉下来 + 兜底 direct，是「只有名单里那几个站能通、其它全打不开」
+	// 最常见的原因：没命中规则的域名一律返回真实 IP，手机直接连源站。
+	// 这种情况必须响一声，不能只留一行 info 埋在 journal 里。
+	if n := rules.Count(); n < 50 && rules.Final == ActionDirect {
+		logf("error", "只有 %d 条规则且兜底为 direct：除名单内域名外都会解析成真实 IP 直连，墙外站点会打不开", n)
+		logf("error", "先确认远程规则源能拉到（curl 一下规则 URL），或临时把 %s 里的 FINAL 改成 proxy", cfg.RulesFile)
+	}
 	holder := &ruleHolder{rs: rules, remote: remote}
 
 	tlsCfg := &tls.Config{

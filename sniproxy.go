@@ -26,6 +26,54 @@ type snipSvc struct {
 
 	tlsUp  atomic.Bool
 	httpUp atomic.Bool
+
+	inflight atomic.Int64
+	// 自环丢弃日志限流：扫描器会持续打同一个地址，不压一下会把 journal 刷满
+	selfDropLast   atomic.Int64
+	selfDropLogged atomic.Int64
+}
+
+// maxInflight 限制同时处理的连接数。fd 是共享资源，一旦被打满，
+// 连 DoT 的解析请求都分配不到 socket，表现就是「所有网站都挂了」。
+// 每个连接占 2 个 fd，4096 条远小于 65535 的上限，留足余量。
+const maxInflight = 4096
+
+// selfAddrs 保存本机所有 IPv4 地址。转发前先比对一下：
+// 扫描器经常拿 VPS 自己的 IP 或域名当 Host 打 :80/:443，
+// 照转发出去就正好回到自己的监听口——一条连接变两条、两条变四条，
+// 几十秒内把 fd 吃干净，DNS 和 443 一起瘫掉。
+var selfAddrs atomic.Pointer[map[string]bool]
+
+func loadSelfAddrs(extra ...string) {
+	m := map[string]bool{}
+	if addrs, err := net.InterfaceAddrs(); err == nil {
+		for _, a := range addrs {
+			if ipn, ok := a.(*net.IPNet); ok {
+				if ip4 := ipn.IP.To4(); ip4 != nil {
+					m[ip4.String()] = true
+				}
+			}
+		}
+	}
+	for _, s := range extra {
+		if ip := net.ParseIP(strings.TrimSpace(s)); ip != nil {
+			if ip4 := ip.To4(); ip4 != nil {
+				m[ip4.String()] = true
+			}
+		}
+	}
+	selfAddrs.Store(&m)
+}
+
+func isSelfIP(ip net.IP) bool {
+	p := selfAddrs.Load()
+	if p == nil || ip == nil {
+		return false
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		return (*p)[ip4.String()]
+	}
+	return false
 }
 
 // sniCurrent 指向当前存活的 SNI 服务，供健康检查读取真实监听状态。
@@ -64,6 +112,8 @@ func newSnipSvc(cfg *Config, rules func() *RuleSet, dyn *Dyn) *snipSvc {
 func startSNI(cfg *Config, rules func() *RuleSet, dyn *Dyn) error {
 	s := newSnipSvc(cfg, rules, dyn)
 	sniCurrent.Store(s)
+	// 本机地址 + 配置里的网关地址，转发前用来拦自环
+	loadSelfAddrs(cfg.GatewayIP)
 	listeners := []struct {
 		addr  string
 		isTLS bool
@@ -197,6 +247,15 @@ func transientAccept(err error) bool {
 func (s *snipSvc) handle(c net.Conn, isTLS bool) {
 	start := time.Now()
 	defer c.Close()
+
+	// fd 用满是致命状态：这里先挡一道，宁可丢几条连接也别把进程拖死。
+	if s.inflight.Load() >= maxInflight {
+		logf("warn", "并发连接已达上限 %d，丢弃 %s 的新连接", maxInflight, c.RemoteAddr())
+		return
+	}
+	s.inflight.Add(1)
+	defer s.inflight.Add(-1)
+
 	_ = c.SetReadDeadline(time.Now().Add(15 * time.Second))
 
 	br := bufio.NewReaderSize(c, 32*1024)
@@ -218,6 +277,12 @@ func (s *snipSvc) handle(c net.Conn, isTLS bool) {
 	port := 443
 	if !isTLS {
 		port = 80
+	}
+
+	// 目标是本机自己：转发出去必然回到自己的监听口，形成自环。
+	if s.isSelfHost(host) {
+		s.noteSelfDrop(host, port)
+		return
 	}
 
 	// 非托管来源一律直连，避免替别人家的流量做代理。
@@ -493,6 +558,25 @@ func pump(br *bufio.Reader, upstream net.Conn, client net.Conn) {
 	}()
 	<-done
 	<-done
+}
+
+// isSelfHost 判断 host 是否指向本机：IP 字面量命中本机地址，或就是配置里的域名。
+// 网关自己没有站点，这类请求一律不转发。
+func (s *snipSvc) isSelfHost(host string) bool {
+	if ip := net.ParseIP(host); ip != nil {
+		return isSelfIP(ip)
+	}
+	d := strings.ToLower(strings.TrimSuffix(s.cfg.Domain, "."))
+	return d != "" && host == d
+}
+
+// noteSelfDrop 每分钟最多记一条，避免扫描器把 journal 打爆。
+func (s *snipSvc) noteSelfDrop(host string, port int) {
+	now := time.Now().Unix()
+	if n := s.selfDropLogged.Add(1); n%1000 == 0 || now-s.selfDropLast.Load() >= 60 {
+		s.selfDropLast.Store(now)
+		logf("info", "已丢弃指向本机的请求 %s:%d（累计 %d 条，防自环）", host, port, n)
+	}
 }
 
 func remoteIPOf(c net.Conn) net.IP {

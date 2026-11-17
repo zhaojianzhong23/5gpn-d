@@ -517,6 +517,11 @@ func DialVia(e Exit, host string, port int, timeout time.Duration, remoteDNS fun
 	if err != nil {
 		return nil, err
 	}
+	// 域名解析回本机（比如把自己的域名当 Host 打进来），转发就是自环，
+	// 直接拒掉，别让它把连接数翻倍。
+	if isSelfIP(ip) {
+		return nil, fmt.Errorf("目标 %s 解析到本机地址 %s，已拒绝（自环）", host, ip)
+	}
 	return net.DialTimeout("tcp", net.JoinHostPort(ip.String(), itoa(port)), timeout)
 }
 
