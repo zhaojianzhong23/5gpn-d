@@ -28,15 +28,57 @@ ask() {
     printf -v "$var" '%s' "$ans"
 }
 
+usage() {
+    cat <<'EOF'
+用法: sudo bash install.sh [选项]
+
+  不带参数        未安装则安装；已安装则检查新版本，有就升级
+  --force         已安装时不看版本，直接重装当前最新版（修损坏/换回退版用）
+  -h, --help      显示本帮助
+
+常用环境变量：
+  DOMAIN=dot.example.com       域名（非交互安装必填）
+  EMAIL=you@example.com        证书邮箱（可空，留空走无邮箱注册）
+  CLIENT_CIDR=172.22.0.0/16    客户端网段
+  GATEWAY_IP=172.22.2.1        网关地址（默认自动探测）
+  SOCKS5=user:pass@host:port   额外加一个 socks5 出口
+  TG_TOKEN=... TG_ADMINS=...   Telegram 控制台
+EOF
+}
+
+FORCE=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --force)    FORCE=1 ;;
+        -h|--help)  usage; exit 0 ;;
+        *)          err "未知参数: $1"; usage; exit 1 ;;
+    esac
+    shift
+done
+
 [[ $EUID -eq 0 ]] || { err "请用 root 运行"; exit 1; }
 command -v systemctl >/dev/null || { err "需要 systemd"; exit 1; }
 
 # 任何一步失败都别悄悄退出：说清在哪一阶段断的、主机上留下了什么。
 STEP="检查环境"
+MODE=install
 on_exit() {
     local code=$?
     if [[ $code -eq 0 ]]; then return 0; fi
     printf '\n' >&2
+    if [[ "$MODE" == "upgrade" ]]; then
+        err "升级中断：在「$STEP」阶段失败（退出码 $code）"
+        cat >&2 <<EOF
+
+服务可能还是旧版在跑，也可能已经换成新版但没起来。先看一眼：
+  systemctl status dotmux --no-pager
+  journalctl -u dotmux -n 50 --no-pager
+  $BIN -version
+
+回滚用的旧二进制在 ${BIN}.bak，正常升级完成后会自动删掉。
+EOF
+        return 0
+    fi
     err "安装中断：在「$STEP」阶段失败（退出码 $code）"
     cat >&2 <<EOF
 
@@ -58,6 +100,136 @@ SOCKS5="${SOCKS5:-}"
 TG_TOKEN="${TG_TOKEN:-}"
 TG_ADMINS="${TG_ADMINS:-}"
 QUIC_ENABLED="${QUIC_ENABLED:-1}"
+
+# ---------- 安装 or 升级 ----------
+# 不单独提供 upgrade 命令：跑同一个脚本，装过就只查版本、换二进制、重启。
+# 装依赖、签证书这些只在首次安装时做。
+
+arch_of() {
+    case "$(uname -m)" in
+        x86_64|amd64)  echo amd64 ;;
+        aarch64|arm64) echo arm64 ;;
+        *)             echo "" ;;
+    esac
+}
+
+# $1 是否比 $2 新。按版本序比，别用字符串比——v0.4.10 在字典序里小于 v0.4.9。
+ver_gt() {
+    [[ "$1" == "$2" ]] && return 1
+    [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" == "$1" ]]
+}
+
+# 取最新标签：先用 releases/latest 的重定向（不占 API 配额），
+# 失败再退回 API。两个都拿不到就返回空，由调用方决定不升级。
+latest_tag() {
+    local t=""
+    t=$(curl -fsSIL --max-time 20 -o /dev/null -w '%{url_effective}' \
+        "https://github.com/${REPO}/releases/latest" 2>/dev/null | sed -n 's#.*/tag/##p')
+    if [[ -z "$t" ]]; then
+        t=$(curl -fsS --max-time 20 -H 'Accept: application/vnd.github+json' \
+            "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
+            | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    fi
+    printf '%s' "$t"
+}
+
+upgrade_if_needed() {
+    local force="$1" cur latest arch base url tmp newbin
+    MODE=upgrade
+    cur=$("$BIN" -version 2>/dev/null | awk '{print $2}')
+    cur="${cur:-dev}"
+    info "已安装：${cur}，检查是否有新版本..."
+
+    latest="${LATEST:-}"
+    [[ -n "$latest" ]] || latest=$(latest_tag)
+    if [[ -z "$latest" ]]; then
+        warn "查不到最新版本（网络或 GitHub 不可达），本次跳过"
+        echo "  当前版本：${cur}"
+        echo "  网络恢复后重跑本脚本即可；只想重装当前版：sudo bash install.sh --force"
+        return 0
+    fi
+
+    # dev 是本地构建或旧版没注入版本号，无从比较，直接当需要升级
+    if [[ "$force" -eq 0 && "$cur" != "dev" ]] && ! ver_gt "${latest#v}" "${cur#v}"; then
+        ok "已是最新版本 ${latest}，无需升级"
+        return 0
+    fi
+
+    arch=$(arch_of)
+    if [[ -z "$arch" ]]; then
+        err "不支持的架构：$(uname -m)（只有 amd64 / arm64）"
+        return 1
+    fi
+
+    base="${RELEASE_BASE:-https://github.com/${REPO}/releases}"
+    url="$base/download/${latest}/dotmux-linux-${arch}"
+    STEP="升级到 ${latest}"
+
+    info "下载 ${latest}（linux-${arch}）..."
+    tmp=$(mktemp -d)
+    newbin="$tmp/dotmux-linux-${arch}"
+    if ! curl -fsSL --max-time 600 --retry 3 --retry-delay 2 -o "$newbin" "$url"; then
+        err "下载失败，当前版本 ${cur} 保持不变"
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    if curl -fsSL --max-time 30 -o "${newbin}.sha256" "${url}.sha256" 2>/dev/null \
+        && [[ -s "${newbin}.sha256" ]]; then
+        if ! (cd "$tmp" && sha256sum -c "dotmux-linux-${arch}.sha256" >/dev/null 2>&1); then
+            err "sha256 校验不通过，文件可能不完整，已中止（当前版本不变）"
+            rm -rf "$tmp"
+            return 1
+        fi
+        ok "sha256 校验通过"
+    else
+        warn "没拿到校验文件，跳过校验"
+    fi
+
+    # 先落临时名再 rename：直接覆盖正在运行的二进制会 Text file busy，
+    # rename 是原子替换，运行中的进程继续用旧 inode，不受影响。
+    if ! install -m 0755 "$newbin" "${BIN}.new"; then
+        err "写入 ${BIN}.new 失败"
+        rm -rf "$tmp"
+        return 1
+    fi
+    if ! "${BIN}.new" -version >/dev/null 2>&1; then
+        err "新二进制无法执行，已中止（当前版本不变）"
+        rm -f "${BIN}.new"
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    cp -a "$BIN" "${BIN}.bak" 2>/dev/null || true
+    mv -f "${BIN}.new" "$BIN"
+    rm -rf "$tmp"
+
+    info "重启服务..."
+    systemctl restart dotmux 2>/dev/null || true
+    sleep 2
+    if ! systemctl is-active --quiet dotmux; then
+        err "新版本没能起来，回滚到 ${cur}"
+        if [[ -f "${BIN}.bak" ]]; then
+            mv -f "${BIN}.bak" "$BIN"
+            systemctl restart dotmux 2>/dev/null || true
+            sleep 1
+        fi
+        journalctl -u dotmux -n 30 --no-pager 2>/dev/null || true
+        return 1
+    fi
+    rm -f "${BIN}.bak"
+
+    ok "已升级到 ${latest}"
+    "$BIN" -version 2>/dev/null || true
+    echo "  配置、规则、证书都原样保留，没有重新签发"
+    echo "  要退回旧版：sudo bash install.sh --force（会装上最新版，旧版请手动放回）"
+}
+
+# 装过就只做升级检查，不再重复装依赖、签证书
+if [[ -x "$BIN" && -f "$CONF" ]]; then
+    upgrade_if_needed "$FORCE"
+    exit $?
+fi
 
 if [[ -z "$DOMAIN" ]]; then
     ask "DoT 域名（A 记录已指向本机）: " DOMAIN

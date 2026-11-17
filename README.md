@@ -57,7 +57,7 @@ sudo DOMAIN=dot.example.com EMAIL=you@example.com CLIENT_CIDR=172.22.0.0/16 \
      TG_TOKEN=123456:ABC TG_ADMINS=123456789 bash install.sh
 ```
 
-安装器只问三件事：**域名**（必填）、**Telegram Bot Token**（可空）、**证书邮箱**（可空，留空就用无邮箱注册）。其余全部走默认：
+首次安装只问三件事：**域名**（必填）、**Telegram Bot Token**（可空）、**证书邮箱**（可空，留空就用无邮箱注册）。其余全部走默认：
 
 | 项 | 默认 | 想改就传环境变量 |
 |---|---|---|
@@ -69,6 +69,28 @@ sudo DOMAIN=dot.example.com EMAIL=you@example.com CLIENT_CIDR=172.22.0.0/16 \
 安装器流程：签证书 → 装二进制 → 写配置和规则 → 装 systemd 并启动。已存在的配置、规则、证书一律保留，可重复执行。
 
 任何一步失败都会报出**卡在哪一阶段**，并提示主机可能处于半装状态，不会静默退出。
+
+### 升级
+
+**还是那条命令**，不需要记新的：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zhaojianzhong23/5gpn-d/main/install.sh -o install.sh
+sudo bash install.sh
+```
+
+脚本开头先判断 `/usr/local/bin/dotmux` 在不在：
+
+| 情况 | 行为 |
+|---|---|
+| 没装过 | 走完整安装 |
+| 已装、有新版本 | 只下载新二进制 → sha256 校验 → 替换 → 重启，**不碰配置、规则、证书** |
+| 已装、已是最新 | 打印 `已是最新版本 vX.Y.Z` 后退出 |
+| 查不到版本（断网 / GitHub 不通） | 不升级，提示稍后重试，正在跑的服务不受影响 |
+
+升级过程中是原子的：新二进制先写成 `dotmux.new`，确认能执行后再 rename 覆盖（直接覆盖正在运行的文件会 `Text file busy`）。旧版留一份 `dotmux.bak`，重启后 2 秒内没起来就自动回滚，并打出 `journalctl` 最后 30 行。
+
+`--force` 跳过版本判断，直接重装最新版——二进制损坏或想手动换版本时用。`dev` 版本（本地 `go build`，没注入版本号）一律当作需要升级。
 
 ### 卸载
 
