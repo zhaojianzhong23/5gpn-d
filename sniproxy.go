@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -205,6 +207,11 @@ func (s *snipSvc) handle(c net.Conn, isTLS bool) {
 	}
 	_ = c.SetReadDeadline(time.Time{})
 
+	// ACME 续期：challenge 必须由本机直接应答，转发出去会打回自己。
+	if !isTLS && s.acmeChallenge(c, br) {
+		return
+	}
+
 	remoteIP := remoteIPOf(c)
 	managed := inNets(remoteIP, s.nets)
 
@@ -241,6 +248,80 @@ func (s *snipSvc) handle(c net.Conn, isTLS bool) {
 	_ = upstream.SetDeadline(time.Now().Add(2 * time.Minute))
 	pump(br, upstream, c)
 	logf("debug", "%s %s:%d via %s %dms", classify(isTLS), host, port, exit.Name, time.Since(start).Milliseconds())
+}
+
+// acmeChallenge 处理 http-01 校验：命中 /.well-known/acme-challenge/<token>
+// 就直接回文件，不再走「按 Host 转发」——网关自己就是那台机器，转发等于打回自己。
+// 返回 true 表示这个连接已经被它处理完。
+func (s *snipSvc) acmeChallenge(c net.Conn, br *bufio.Reader) bool {
+	root := s.cfg.ACMEWebroot
+	if root == "" {
+		return false
+	}
+	path := peekPath(br)
+	const prefix = "/.well-known/acme-challenge/"
+	if !strings.HasPrefix(path, prefix) {
+		return false
+	}
+	token := strings.TrimPrefix(path, prefix)
+	// 只认 base64url 字符，杜绝 ../ 之类的路径穿越
+	for _, r := range token {
+		okChar := r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' ||
+			r >= '0' && r <= '9' || r == '-' || r == '_'
+		if !okChar {
+			writeHTTP(c, 404, "text/plain", "not found")
+			return true
+		}
+	}
+	if token == "" {
+		writeHTTP(c, 404, "text/plain", "not found")
+		return true
+	}
+	file := filepath.Join(root, ".well-known", "acme-challenge", token)
+	data, err := os.ReadFile(file)
+	if err != nil {
+		logf("warn", "ACME challenge %s 读取失败: %v", token, err)
+		writeHTTP(c, 404, "text/plain", "not found")
+		return true
+	}
+	writeHTTP(c, 200, "text/plain", strings.TrimSpace(string(data)))
+	logf("info", "ACME challenge 已应答: %s", token)
+	return true
+}
+
+func writeHTTP(c net.Conn, code int, ctype, body string) {
+	reason := "OK"
+	if code != 200 {
+		reason = "Not Found"
+	}
+	_, _ = fmt.Fprintf(c, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+		code, reason, ctype, len(body), body)
+}
+
+// peekPath 从已缓冲的请求头里取出请求行里的路径。
+func peekPath(br *bufio.Reader) string {
+	n := br.Buffered()
+	if n <= 0 {
+		return ""
+	}
+	buf, _ := br.Peek(n)
+	if i := bytes.IndexByte(buf, '\n'); i >= 0 {
+		buf = buf[:i]
+	}
+	f := bytes.Fields(buf)
+	if len(f) < 2 {
+		return ""
+	}
+	p := string(f[1])
+	// 代理式绝对 URI：GET http://host/path HTTP/1.1
+	if i := strings.Index(p, "://"); i >= 0 {
+		if j := strings.IndexByte(p[i+3:], '/'); j >= 0 {
+			p = p[i+3+j:]
+		} else {
+			return "/"
+		}
+	}
+	return p
 }
 
 func classify(isTLS bool) string {

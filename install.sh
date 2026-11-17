@@ -430,6 +430,17 @@ else
     ok "证书已签发"
 fi
 
+# 续期改走 webroot：以后 80 归 dotmux 所有，standalone 会抢不到端口。
+# dotmux 在 80 上直接应答 /.well-known/acme-challenge/，续期不需要停服务。
+mkdir -p /var/www/html/.well-known/acme-challenge
+RCONF="/etc/letsencrypt/renewal/$DOMAIN.conf"
+if [[ -f "$RCONF" ]] && ! grep -q '^webroot_path' "$RCONF"; then
+    sed -i -e 's/^authenticator = .*/authenticator = webroot/' \
+           -e '/^pre_hook/d' -e '/^renew_hook/d' -e '/^post_hook/d' "$RCONF"
+    printf 'webroot_path = /var/www/html,\n' >> "$RCONF"
+    ok "续期方式已切到 webroot（dotmux 自己应答 ACME challenge）"
+fi
+
 # ---------- 二进制 ----------
 STEP="安装二进制"
 case "$(uname -m)" in
@@ -466,6 +477,7 @@ else
   "domain": "$DOMAIN",
   "cert_file": "/etc/letsencrypt/live/$DOMAIN/fullchain.pem",
   "key_file": "/etc/letsencrypt/live/$DOMAIN/privkey.pem",
+  "acme_webroot": "/var/www/html",
   "gateway_ip": "$GATEWAY_IP",
   "client_cidr": ["$CLIENT_CIDR"],
   "ecs": "${ECS:-139.226.48.1}",
