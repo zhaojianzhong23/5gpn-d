@@ -25,7 +25,7 @@ iPhone/Android ── DoT :853 ──► dotmux ──► 国内域名：返回�
 | 多出口 | `exits[]` 可放任意多个出口：`direct`、`socks5`，或直接粘 **ss / vmess / vless / trojan / hysteria2 / tuic / anytls** 分享链接（由内置 mihomo 落地）；规则用 `proxy:名字` 精确指定，默认出口 Bot 里一键切换 |
 | 规则 | 本地文件 + 定时拉取远程规则源（clash / domain / gfwlist / dnsmasq），格式猜错自动换着试，失败回退上次缓存 |
 | 控制 | Telegram 面板：状态、出口增删改查与探测、规则与规则集增删、分类映射、DNS/域名/证书、日志、重启 |
-| 边界 | 只接管 `client_cidr` 内的来源，其它来源按真实地址解析，不影响别人 |
+| 边界 | 只接管 `client_cidr` 内的来源，其它来源按真实地址解析，不影响别人；非托管来源另有一条 512 并发的独立额度，扫描器吃不满整机，也留着自己设备回程的路 |
 | 热更新 | 规则、出口、DNS、分流开关改完立即生效；证书每次握手重新读文件，certbot 续期后无需重启 |
 
 ## 前提
