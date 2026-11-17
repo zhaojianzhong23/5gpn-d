@@ -96,19 +96,26 @@ func startSNI(cfg *Config, rules func() *RuleSet, dyn *Dyn) error {
 // 没人持有 listener 就会被回收，443 就这么静悄悄消失了。
 func (s *snipSvc) supervise(addr string, isTLS bool, first net.Listener) {
 	backoff := 50 * time.Millisecond
-	fails := 0
 	ln := first
+	lastMsg := ""
+	var lastLog time.Time
 	for {
 		if ln == nil {
 			var err error
 			ln, err = net.Listen("tcp", addr)
 			if err != nil {
 				s.setAlive(isTLS, false)
-				// 80 端口常年被占是已知情况，别每 2 秒刷一行日志
-				if fails == 0 || fails%30 == 0 {
-					logf("error", "监听 %s 失败: %v（%s 后重试）", addr, err, backoff)
+				// 端口被别的程序长期占着是常态（比如 :80 上有 nginx / certbot）。
+				// 只在错误变化时、以及每 5 分钟报一次，别把 journal 刷满。
+				msg := err.Error()
+				if msg != lastMsg || time.Since(lastLog) > 5*time.Minute {
+					hint := ""
+					if errors.Is(err, syscall.EADDRINUSE) {
+						hint = fmt.Sprintf("，占用者：ss -lntp | grep ':%s '", portOf(addr))
+					}
+					logf("warn", "监听 %s 失败: %v%s（持续重试中）", addr, err, hint)
+					lastMsg, lastLog = msg, time.Now()
 				}
-				fails++
 				time.Sleep(backoff)
 				if backoff < 2*time.Second {
 					backoff *= 2
@@ -120,8 +127,8 @@ func (s *snipSvc) supervise(addr string, isTLS bool, first net.Listener) {
 			}
 		}
 		backoff = 50 * time.Millisecond
-		fails = 0
 		s.setAlive(isTLS, true)
+		lastMsg = ""
 		logf("info", "SNI 转发监听 %s (tls=%v)", addr, isTLS)
 
 		err := s.acceptLoop(ln, isTLS)
@@ -130,6 +137,14 @@ func (s *snipSvc) supervise(addr string, isTLS bool, first net.Listener) {
 		ln = nil
 		logf("warn", "监听 %s 退出: %v，正在重建", addr, err)
 	}
+}
+
+// portOf 从 ":443" / "0.0.0.0:80" 里取出端口，仅用于日志提示。
+func portOf(addr string) string {
+	if i := strings.LastIndex(addr, ":"); i >= 0 {
+		return addr[i+1:]
+	}
+	return addr
 }
 
 func (s *snipSvc) acceptLoop(ln net.Listener, isTLS bool) error {
