@@ -21,7 +21,7 @@ iPhone/Android ── DoT :853 ──► dotmux ──► 国内域名：返回�
 | DNS（853/DoT） | 按规则分成 `direct` / `proxy[:出口]` / `block`；`proxy` 的 A 记录返回网关 IP，`block` 返回 NXDOMAIN |
 | 记录抑制 | 对托管客户端拒绝 `AAAA`、`HTTPS`、`SVCB`，防止拿到真实地址绕过网关 |
 | TCP 443/80 | 从 ClientHello 读 SNI（HTTP 读 Host），按域名选出口转发 |
-| QUIC UDP/443 | 解密 QUIC v1 Initial 包取 SNI，按规则走 SOCKS5 UDP 关联或直连；会话按来源地址维护，空闲回收 |
+| QUIC UDP/443 | 解密 QUIC v1 Initial 包取 SNI，按规则走 SOCKS5 UDP 关联或直连；会话按连接 ID 维护，空闲回收（默认关，见下） |
 | 多出口 | `exits[]` 可放任意多个出口：`direct`、`socks5`，或直接粘 **ss / vmess / vless / trojan / hysteria2 / tuic / anytls** 分享链接（由内置 mihomo 落地）；规则用 `proxy:名字` 精确指定，默认出口 Bot 里一键切换 |
 | 规则 | 本地文件 + 定时拉取远程规则源（gfwlist / clash / 纯域名），失败回退上次缓存 |
 | 控制 | Telegram 面板：状态、出口增删改查与探测、规则与规则集增删、分类映射、DNS/域名/证书、日志、重启 |
@@ -62,7 +62,7 @@ sudo DOMAIN=dot.example.com EMAIL=you@example.com CLIENT_CIDR=172.22.0.0/16 \
 | 项 | 默认 | 想改就传环境变量 |
 |---|---|---|
 | 客户端网段 | `172.22.0.0/16`（填单个 IP 也可，按 /32） | `CLIENT_CIDR=10.8.0.0/24` |
-| QUIC 中继 | 开 | `QUIC_ENABLED=0` |
+| QUIC 中继 | 关（浏览器回落 TCP，分流照旧） | `QUIC_ENABLED=1` 打开 |
 | 网关地址 | 自动探测：先找本机同段地址，找不到用公网 IP | `GATEWAY_IP=172.22.1.10` |
 | 出口 | 只有 `local` 直连 | `SOCKS5=user:pass@host:port` |
 
@@ -229,14 +229,18 @@ FINAL,direct
 
 所有改动都写回 `config.json`（保留原文件其余内容，留一份 `.bak`），并立即生效——除了改域名，它需要重启才能换上新证书。
 
-## QUIC 中继
+## QUIC 中继（默认关）
 
 `quic.enabled: true` 时监听 UDP 443：
 
 1. 从客户端第一个 Initial 包取 DCID，用 RFC 9001 的 v1 salt 派生 client initial 密钥；
 2. 去除 header protection、AES-GCM 解密，从 CRYPTO 帧里取 ClientHello 的 SNI；
-3. 按规则判定出口后，走 SOCKS5 UDP ASSOCIATE（`socks5` / `mihomo` 出口）或本机直连建立上行，后续包按来源地址直接透传；
+3. 按规则判定出口后，走 SOCKS5 UDP ASSOCIATE（`socks5` / `mihomo` 出口）或本机直连建立上行，后续包按连接 ID 透传；
 4. 会话空闲 `idle_sec` 秒回收。
+
+**为什么默认关：** 一个客户端（手机）在一个 NAT 后面，浏览器会从同一个本地 UDP 端口同时向多个站点开 HTTP/3 连接，而它们全部落在网关的同一个 `443/udp` 上。诚实地说，QUIC 的报文除了首个 Initial，其余都加密，里面携带的连接 ID 会被对端在握手中途换成 `NEW_CONNECTION_ID` 发的新值——中间人读不到。所以单入口**只可能稳定服务每客户端一条 QUIC 连接**；第二条一来就只能二选一，选错就是把 A 站点的报文发给 B 站点，现象正是「第一次能打开，刷新就 404 / 白屏」。
+
+现在的实现是：按连接 ID 精确分流（能对上就对上），对不上且该客户端只有一条会话时才认领，出现第二条就丢弃——宁可让浏览器回落到 TCP（走 SNI 通道，分流完全正确），也不串流。真要打开 `QUIC_ENABLED=1`，请接受「H3 基本不可用、只是延迟回落」这个前提；关着反而是更干净的状态：内核直接回 ICMP unreachable，浏览器立刻回落，没有多余的等待。
 
 **QUIC 与 TCP 走同一个出口。** 规则判成 `proxy` 时，QUIC 通过 SOCKS5 UDP ASSOCIATE 让代理端解析域名并转发，源 IP 与 TCP 一致；代理不可用时直接丢弃，**不会悄悄回退成本机出口**——那等于把手机卡 IP 露出去。
 
@@ -244,7 +248,7 @@ UDP 关联的代价：每个 QUIC 会话要额外占一条到代理的 TCP 控�
 
 想让 QUIC 一律从网关本机发出（例如代理不支持 UDP，或你就想让它走手机卡），设 `quic.udp_direct: true`。
 
-其他限制：只识别 QUIC v1（v2 和 draft 版本会解析失败并丢弃）；首包解析不出 SNI 就丢弃，不做跨包拼接。
+其他限制：只识别 QUIC v1（v2 和 draft 版本会解析失败并丢弃）；首包解析不出 SNI 就丢弃，不做跨包拼接；一个客户端同时只服务一条 QUIC 连接（原因见上）。
 
 ## 客户端接入
 
@@ -271,6 +275,7 @@ bash scripts/make-profile.sh dot.example.com 203.0.113.10 > dotmux.mobileconfig
 
 ## 已知限制
 
+- **QUIC 中继默认关，且每个客户端同时只能服务一条连接**：报文加密后连接 ID 会被换成读不到的新值，单入口没法可靠区分同一 NAT 后面的多条 H3 连接（详见上文）。
 - **QUIC 的 UDP 关联依赖节点支持 UDP 转发**，服务端没开 `udp` 时 QUIC 连不上（TCP 不受影响）。
 - **无 SNI 的连接无法还原目标**，直接断开（WhatsApp 部分流量属于这类）。
 - **无 Web 面板**，只有 Bot 和命令行。
