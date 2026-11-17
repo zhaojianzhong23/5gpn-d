@@ -52,6 +52,18 @@ ADMIN_JSON="[]"
 if [[ -n "$TG_ADMINS" ]]; then
     ADMIN_JSON="[$(printf '%s' "$TG_ADMINS" | tr -d ' ')]"
 fi
+
+# 出口表：至少一个直连；给了 SOCKS5 就再加一个代理出口并设为默认
+if [[ -n "$SOCKS5" ]]; then
+    EXITS_JSON="[
+      { \"name\": \"local\", \"type\": \"direct\", \"addr\": \"\" },
+      { \"name\": \"proxy\", \"type\": \"socks5\", \"addr\": \"$SOCKS5\" }
+    ]"
+    DEF_EXIT="proxy"
+else
+    EXITS_JSON="[{ \"name\": \"local\", \"type\": \"direct\", \"addr\": \"\" }]"
+    DEF_EXIT="local"
+fi
 [[ -n "$GATEWAY_IP" ]] || { err "需要公网 IPv4"; exit 1; }
 
 info "安装依赖..."
@@ -103,12 +115,16 @@ else
     cat > "$CONF" <<EOF
 {
   "listen": { "dot": ":853", "tls": ":443", "http": ":80" },
+  "domain": "$DOMAIN",
   "cert_file": "/etc/letsencrypt/live/$DOMAIN/fullchain.pem",
   "key_file": "/etc/letsencrypt/live/$DOMAIN/privkey.pem",
   "gateway_ip": "$GATEWAY_IP",
   "client_cidr": ["$CLIENT_CIDR"],
-  "upstream_dns": ["223.5.5.5:53", "119.29.29.29:53"],
-  "socks5": "$SOCKS5",
+  "remote_dns": ["1.1.1.1", "8.8.8.8", "9.9.9.9"],
+  "local_dns": ["101.226.4.6", "218.30.118.6", "180.76.76.76", "119.29.29.29"],
+  "exits": $EXITS_JSON,
+  "default_exit": "$DEF_EXIT",
+  "routing_enabled": true,
   "rules_file": "$RULES",
   "cache_size": 8192,
   "synthetic_ttl": 60,
@@ -153,6 +169,8 @@ DOMAIN-SUFFIX,twitter.com,proxy
 DOMAIN-SUFFIX,telegram.org,proxy
 DOMAIN-SUFFIX,github.com,proxy
 DOMAIN-KEYWORD,doubleclick,block
+# 指定出口：proxy:出口名（出口名在 Bot 的「出口管理」里能看到）
+# DOMAIN-SUFFIX,netflix.com,proxy:香港
 
 FINAL,direct
 EOF
@@ -201,6 +219,7 @@ cat <<EOF
   DoT 域名   : $DOMAIN:853
   网关地址   : $GATEWAY_IP
   客户端网段 : $CLIENT_CIDR
+  默认出口   : $DEF_EXIT
   配置文件   : $CONF
   规则文件   : $RULES
 
@@ -209,6 +228,7 @@ cat <<EOF
     nft add rule inet filter input tcp dport { 80, 443, 853 } accept
     nft add rule inet filter input udp dport 443 accept
 
+  Telegram 面板：/menu 看状态、切出口、改 DNS、续期证书
   改完规则热重载：systemctl reload dotmux
   看日志        ：journalctl -u dotmux -f
 

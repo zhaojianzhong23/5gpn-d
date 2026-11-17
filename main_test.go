@@ -127,6 +127,7 @@ func TestDoTSplit(t *testing.T) {
 	cfg.GatewayIP = "203.0.113.9"
 	cfg.ClientCIDR = []string{"127.0.0.0/8"}
 	cfg.UpstreamDNS = []string{"127.0.0.1:15353"}
+	cfg.LocalDNS = []string{"127.0.0.1:15353"}
 	cfg.RulesFile = rulesFile
 	if err := cfg.validate(); err != nil {
 		t.Fatal(err)
@@ -140,7 +141,8 @@ func TestDoTSplit(t *testing.T) {
 		c, err := tls.LoadX509KeyPair(certFile, keyFile)
 		return &c, err
 	}}
-	if _, err := startDoT(cfg, func() *RuleSet { return rules }, tlsCfg); err != nil {
+	dyn := newDyn(cfg, "")
+	if _, err := startDoT(cfg, func() *RuleSet { return rules }, dyn, tlsCfg); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(200 * time.Millisecond)

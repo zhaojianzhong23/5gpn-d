@@ -29,6 +29,7 @@ type quicRelay struct {
 	conn   *net.UDPConn
 	cfg    *Config
 	rules  func() *RuleSet
+	dyn    *Dyn
 	nets   []*net.IPNet
 	idle   time.Duration
 	port   int
@@ -50,7 +51,7 @@ func (s *quicSession) close() {
 	s.once.Do(func() { _ = s.upstream.Close() })
 }
 
-func startQUIC(cfg *Config, rules func() *RuleSet) error {
+func startQUIC(cfg *Config, rules func() *RuleSet, dyn *Dyn) error {
 	addr, err := net.ResolveUDPAddr("udp", cfg.QUIC.Listen)
 	if err != nil {
 		return err
@@ -63,6 +64,7 @@ func startQUIC(cfg *Config, rules func() *RuleSet) error {
 		conn:  conn,
 		cfg:   cfg,
 		rules: rules,
+		dyn:   dyn,
 		nets:  cfg.ClientNets(),
 		idle:  time.Duration(cfg.QUIC.IdleSec) * time.Second,
 		port:  443,
@@ -113,15 +115,18 @@ func (r *quicRelay) handleNew(addr *net.UDPAddr, pkt []byte) {
 	if !inNets(addr.IP, r.nets) {
 		return // 非托管来源不接管
 	}
-	switch r.rules().Match(host) {
-	case ActionBlock:
+	act := ActionProxy
+	if r.dyn.RoutingEnabled() {
+		act, _ = r.rules().MatchRoute(host)
+	}
+	if act == ActionBlock {
 		logf("info", "block(quic) %s from %s", host, addr.IP)
 		return
-	case ActionDirect:
-		// DNS 已给真实地址，正常不会回到网关；若回来了，按直连转发也用真实 IP
 	}
 
-	ip, err := resolveA(r.cfg.UpstreamDNS, host)
+	// QUIC 走 UDP，无法穿过 SOCKS5（需要 UDP ASSOCIATE），所以统一从网关本机出口；
+	// 用国际 DNS 解析，拿到的是源站真实地址。
+	ip, err := resolveA(r.dyn.RemoteDNS(), host)
 	if err != nil {
 		logf("warn", "QUIC 解析目标失败 %s: %v", host, err)
 		return

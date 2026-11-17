@@ -13,6 +13,10 @@ import (
 // dialSocks5 通过 SOCKS5 代理连接到 host:port。
 // addr 支持 "127.0.0.1:1080" 和 "user:pass@127.0.0.1:1080"。
 func dialSocks5(addr, host string, port int) (net.Conn, error) {
+	return dialSocks5Timeout(addr, host, port, 8*time.Second)
+}
+
+func dialSocks5Timeout(addr, host string, port int, timeout time.Duration) (net.Conn, error) {
 	var user, pass string
 	target := addr
 	if i := strings.LastIndex(addr, "@"); i >= 0 {
@@ -24,11 +28,14 @@ func dialSocks5(addr, host string, port int) (net.Conn, error) {
 			user = cred
 		}
 	}
-	c, err := net.DialTimeout("tcp", target, 8*time.Second)
+	if timeout <= 0 {
+		timeout = 8 * time.Second
+	}
+	c, err := net.DialTimeout("tcp", target, timeout)
 	if err != nil {
 		return nil, fmt.Errorf("连接代理失败: %w", err)
 	}
-	_ = c.SetDeadline(time.Now().Add(10 * time.Second))
+	_ = c.SetDeadline(time.Now().Add(timeout + 2*time.Second))
 
 	methods := []byte{0x00}
 	if user != "" {

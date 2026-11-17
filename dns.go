@@ -65,16 +65,18 @@ func (c *dnsCache) put(key string, msg *dns.Msg, ttl uint32) {
 type dnsSvc struct {
 	cfg   *Config
 	rules func() *RuleSet
+	dyn   *Dyn
 	nets  []*net.IPNet
 	cache *dnsCache
 	// 启动时确定，避免每包解析
 	gatewayV4 net.IP
 }
 
-func newDNSSvc(cfg *Config, rules func() *RuleSet) *dnsSvc {
+func newDNSSvc(cfg *Config, rules func() *RuleSet, dyn *Dyn) *dnsSvc {
 	return &dnsSvc{
 		cfg:       cfg,
 		rules:     rules,
+		dyn:       dyn,
 		nets:      cfg.ClientNets(),
 		cache:     newDNSCache(cfg.CacheSize),
 		gatewayV4: net.ParseIP(cfg.GatewayIP).To4(),
@@ -111,11 +113,16 @@ func (s *dnsSvc) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
-	switch s.rules().Match(name) {
+	act := ActionProxy // 关闭分流时全部托管流量走默认出口
+	if s.dyn.RoutingEnabled() {
+		act, _ = s.rules().MatchRoute(name)
+	}
+	switch act {
 	case ActionBlock:
 		s.replyEmpty(w, req, dns.RcodeNameError)
 		return
 	case ActionProxy:
+		// 返回网关地址，客户端把流量交给 443/80 的 SNI 转发
 		s.replyA(w, req, q, s.gatewayV4, s.cfg.SyntheticTTL)
 		return
 	default:
@@ -175,8 +182,12 @@ func (s *dnsSvc) forward(w dns.ResponseWriter, req *dns.Msg) {
 }
 
 func (s *dnsSvc) exchange(req *dns.Msg) (*dns.Msg, error) {
+	_, local := s.dyn.DNS()
+	if len(local) == 0 {
+		local = s.cfg.LocalDNS
+	}
 	var lastErr error
-	for _, up := range s.cfg.UpstreamDNS {
+	for _, up := range local {
 		c := &dns.Client{Timeout: 3 * time.Second}
 		if resp, _, err := c.Exchange(req, up); err == nil {
 			return resp, nil
@@ -225,12 +236,12 @@ func minTTL(m *dns.Msg) uint32 {
 }
 
 // startDoT 启动 DNS over TLS。
-func startDoT(cfg *Config, rulesHolder func() *RuleSet, tlsCfg *tls.Config) (*dns.Server, error) {
+func startDoT(cfg *Config, rulesHolder func() *RuleSet, dyn *Dyn, tlsCfg *tls.Config) (*dns.Server, error) {
 	ln, err := tls.Listen("tcp", cfg.Listen.DoT, tlsCfg)
 	if err != nil {
 		return nil, err
 	}
-	svc := newDNSSvc(cfg, rulesHolder)
+	svc := newDNSSvc(cfg, rulesHolder, dyn)
 	srv := &dns.Server{Listener: ln, Net: "tcp-tls", Handler: svc}
 	go func() {
 		if err := srv.ActivateAndServe(); err != nil {

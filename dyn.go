@@ -1,0 +1,513 @@
+package main
+
+import (
+	"context"
+	"crypto/tls"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+)
+
+// Dyn 保存可以运行时修改、并且要写回 config.json 的那部分状态。
+// 出口表、默认出口、DNS 池、域名、分流开关都放在这里，Bot 改完立即生效。
+type Dyn struct {
+	mu      sync.RWMutex
+	path    string
+	exits   []Exit
+	defExit string
+	remote  []string
+	local   []string
+	domain  string
+	routing bool
+	sources []RemoteSource
+	// 每个出口的最近一次探测结果，仅用于展示
+	probe map[string]ProbeResult
+}
+
+// ProbeResult 是出口连通性探测结果。
+type ProbeResult struct {
+	IP      string
+	Latency time.Duration
+	Err     string
+	At      time.Time
+}
+
+func newDyn(cfg *Config, path string) *Dyn {
+	d := &Dyn{path: path, probe: map[string]ProbeResult{}}
+	d.loadFrom(cfg)
+	return d
+}
+
+func (d *Dyn) loadFrom(cfg *Config) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.exits = append([]Exit{}, cfg.Exits...)
+	d.defExit = cfg.DefaultExit
+	d.remote = append([]string{}, cfg.RemoteDNS...)
+	d.local = append([]string{}, cfg.LocalDNS...)
+	d.domain = cfg.Domain
+	d.routing = cfg.Routing
+	d.sources = append([]RemoteSource{}, cfg.Rules.Remote...)
+}
+
+// Sources 返回远程规则源副本。
+func (d *Dyn) Sources() []RemoteSource {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	out := make([]RemoteSource, len(d.sources))
+	copy(out, d.sources)
+	return out
+}
+
+// ReplaceSources 整体替换规则源并写回配置。
+func (d *Dyn) ReplaceSources(list []RemoteSource) error {
+	d.mu.Lock()
+	d.sources = append([]RemoteSource{}, list...)
+	d.mu.Unlock()
+	return d.saveSources()
+}
+
+// AddSource 追加一个规则源。
+func (d *Dyn) AddSource(src RemoteSource) error {
+	d.mu.Lock()
+	for _, x := range d.sources {
+		if x.Name == src.Name {
+			d.mu.Unlock()
+			return fmt.Errorf("已存在同名规则集: %s", src.Name)
+		}
+	}
+	d.sources = append(d.sources, src)
+	d.mu.Unlock()
+	return d.saveSources()
+}
+
+// RemoveSource 按名字删除规则源。
+func (d *Dyn) RemoveSource(name string) error {
+	d.mu.Lock()
+	out := d.sources[:0]
+	hit := false
+	for _, x := range d.sources {
+		if x.Name == name {
+			hit = true
+			continue
+		}
+		out = append(out, x)
+	}
+	if !hit {
+		d.mu.Unlock()
+		return fmt.Errorf("没有名为 %s 的规则集", name)
+	}
+	d.sources = out
+	d.mu.Unlock()
+	return d.saveSources()
+}
+
+// SetSourceExit 把某个规则集的流量指向指定出口。
+func (d *Dyn) SetSourceExit(name, exit string) error {
+	d.mu.Lock()
+	found := false
+	for i := range d.sources {
+		if d.sources[i].Name == name {
+			if exit == "" || exit == "direct" {
+				d.sources[i].Action = "direct"
+			} else {
+				d.sources[i].Action = "proxy:" + exit
+			}
+			found = true
+		}
+	}
+	if !found {
+		d.mu.Unlock()
+		return fmt.Errorf("没有名为 %s 的规则集", name)
+	}
+	d.mu.Unlock()
+	return d.saveSources()
+}
+
+// Exits 返回出口表副本。
+func (d *Dyn) Exits() []Exit {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	out := make([]Exit, len(d.exits))
+	copy(out, d.exits)
+	return out
+}
+
+// DefaultExit 返回默认出口名。
+func (d *Dyn) DefaultExit() string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.defExit
+}
+
+// Domain 返回当前域名。
+func (d *Dyn) Domain() string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.domain
+}
+
+// DNS 返回国际、国内两组 DNS。
+func (d *Dyn) DNS() (remote, local []string) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return append([]string{}, d.remote...), append([]string{}, d.local...)
+}
+
+// RemoteDNS 给 sniproxy 直连拨号时解析目标用（拿到境外真实地址）。
+func (d *Dyn) RemoteDNS() []string {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return append([]string{}, d.remote...)
+}
+
+// RoutingEnabled 表示是否按域名分流；关闭时所有托管流量走默认出口。
+func (d *Dyn) RoutingEnabled() bool {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.routing
+}
+
+// Find 按名取出口。
+func (d *Dyn) Find(name string) *Exit {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.findLocked(name)
+}
+
+func (d *Dyn) findLocked(name string) *Exit {
+	for i := range d.exits {
+		if d.exits[i].Name == name {
+			e := d.exits[i]
+			return &e
+		}
+	}
+	return nil
+}
+
+// Resolve 把规则里的出口名解析成实际出口。空名字表示默认出口。
+func (d *Dyn) Resolve(name string) Exit {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if name != "" {
+		if e := d.findLocked(name); e != nil {
+			return *e
+		}
+	}
+	if e := d.findLocked(d.defExit); e != nil {
+		return *e
+	}
+	return Exit{Name: ExitDirect, Type: "direct"}
+}
+
+// SetDefault 切换默认出口并写回配置。
+func (d *Dyn) SetDefault(name string) error {
+	d.mu.Lock()
+	if d.findLocked(name) == nil {
+		d.mu.Unlock()
+		return fmt.Errorf("没有名为 %s 的出口", name)
+	}
+	d.defExit = name
+	d.mu.Unlock()
+	return d.save(map[string]any{"default_exit": name})
+}
+
+// SetRouting 开关分流并写回配置。
+func (d *Dyn) SetRouting(on bool) error {
+	d.mu.Lock()
+	d.routing = on
+	d.mu.Unlock()
+	return d.save(map[string]any{"routing_enabled": on})
+}
+
+// UpsertExit 新增或覆盖出口。
+func (d *Dyn) UpsertExit(e Exit) error {
+	e.Name = strings.TrimSpace(e.Name)
+	e.Type = strings.ToLower(strings.TrimSpace(e.Type))
+	if e.Type == "" {
+		e.Type = "direct"
+	}
+	d.mu.Lock()
+	if old := d.findLocked(e.Name); old != nil {
+		// 覆盖已有出口：保持位置，允许改类型和地址
+		for i := range d.exits {
+			if d.exits[i].Name == e.Name {
+				if e.Type == "direct" {
+					e.Addr = ""
+				}
+				if e.Addr == "" && e.Type == "socks5" {
+					e.Addr = d.exits[i].Addr
+				}
+				d.exits[i] = e
+			}
+		}
+	} else {
+		d.exits = append(d.exits, e)
+	}
+	exits := append([]Exit{}, d.exits...)
+	d.mu.Unlock()
+
+	cfgExits := make([]map[string]any, 0, len(exits))
+	for _, x := range exits {
+		cfgExits = append(cfgExits, map[string]any{"name": x.Name, "type": x.Type, "addr": x.Addr})
+	}
+	return d.save(map[string]any{"exits": cfgExits})
+}
+
+// RenameExit 重命名出口，同时把规则里引用旧名的目标改掉。
+func (d *Dyn) RenameExit(old, newName string) error {
+	newName = strings.TrimSpace(newName)
+	if newName == "" || strings.ContainsAny(newName, " ,\t\n") {
+		return fmt.Errorf("新名字不合法")
+	}
+	d.mu.Lock()
+	if d.findLocked(old) == nil {
+		d.mu.Unlock()
+		return fmt.Errorf("没有名为 %s 的出口", old)
+	}
+	if d.findLocked(newName) != nil {
+		d.mu.Unlock()
+		return fmt.Errorf("已经存在名为 %s 的出口", newName)
+	}
+	for i := range d.exits {
+		if d.exits[i].Name == old {
+			d.exits[i].Name = newName
+		}
+	}
+	if d.defExit == old {
+		d.defExit = newName
+	}
+	exits := append([]Exit{}, d.exits...)
+	def := d.defExit
+	d.mu.Unlock()
+
+	cfgExits := make([]map[string]any, 0, len(exits))
+	for _, x := range exits {
+		cfgExits = append(cfgExits, map[string]any{"name": x.Name, "type": x.Type, "addr": x.Addr})
+	}
+	return d.save(map[string]any{"exits": cfgExits, "default_exit": def})
+}
+
+// DeleteExit 删除出口。直连出口与正在使用的默认出口不允许删。
+func (d *Dyn) DeleteExit(name string) error {
+	d.mu.Lock()
+	e := d.findLocked(name)
+	if e == nil {
+		d.mu.Unlock()
+		return fmt.Errorf("没有名为 %s 的出口", name)
+	}
+	if e.Type == "direct" {
+		d.mu.Unlock()
+		return fmt.Errorf("直连出口不能删除，否则无法回退")
+	}
+	if d.defExit == name {
+		d.mu.Unlock()
+		return fmt.Errorf("%s 是当前默认出口，先切到别的出口再删", name)
+	}
+	out := d.exits[:0]
+	for _, x := range d.exits {
+		if x.Name != name {
+			out = append(out, x)
+		}
+	}
+	d.exits = out
+	exits := append([]Exit{}, d.exits...)
+	d.mu.Unlock()
+
+	cfgExits := make([]map[string]any, 0, len(exits))
+	for _, x := range exits {
+		cfgExits = append(cfgExits, map[string]any{"name": x.Name, "type": x.Type, "addr": x.Addr})
+	}
+	return d.save(map[string]any{"exits": cfgExits})
+}
+
+// SetDNS 更新国际/国内 DNS 池并写回配置。
+func (d *Dyn) SetDNS(remote, local []string) error {
+	d.mu.Lock()
+	if len(remote) > 0 {
+		d.remote = normalizeDNS(remote)
+	}
+	if len(local) > 0 {
+		d.local = normalizeDNS(local)
+	}
+	r := append([]string{}, d.remote...)
+	l := append([]string{}, d.local...)
+	d.mu.Unlock()
+	return d.save(map[string]any{"remote_dns": stripPort(r), "local_dns": stripPort(l)})
+}
+
+// SetDomain 更新域名并写回配置，同时按域名推导证书路径。
+func (d *Dyn) SetDomain(domain string) error {
+	d.mu.Lock()
+	d.domain = domain
+	d.mu.Unlock()
+	patch := map[string]any{"domain": domain}
+	if domain != "" {
+		patch["cert_file"] = "/etc/letsencrypt/live/" + domain + "/fullchain.pem"
+		patch["key_file"] = "/etc/letsencrypt/live/" + domain + "/privkey.pem"
+	}
+	return d.save(patch)
+}
+
+func stripPort(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		out = append(out, strings.TrimSuffix(s, ":53"))
+	}
+	return out
+}
+
+// saveSources 专门写回 rules.remote，保留 rules 下的其它字段。
+func (d *Dyn) saveSources() error {
+	d.mu.Lock()
+	list := append([]RemoteSource{}, d.sources...)
+	path := d.path
+	d.mu.Unlock()
+	if path == "" {
+		return nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("运行时已生效，但读配置失败: %w", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return fmt.Errorf("运行时已生效，但配置解析失败: %w", err)
+	}
+	rules, _ := m["rules"].(map[string]any)
+	if rules == nil {
+		rules = map[string]any{}
+	}
+	arr := make([]map[string]any, 0, len(list))
+	for _, src := range list {
+		arr = append(arr, map[string]any{
+			"name":   src.Name,
+			"url":    src.URL,
+			"format": src.Format,
+			"prefix": src.Prefix,
+			"action": src.Action,
+		})
+	}
+	rules["remote"] = arr
+	m["rules"] = rules
+	out, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	out = append(out, '\n')
+	_ = os.WriteFile(path+".bak", raw, 0o600)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// save 只改指定字段，其余 JSON 内容原样保留，并留一份 .bak。
+func (d *Dyn) save(patch map[string]any) error {
+	d.mu.Lock()
+	path := d.path
+	d.mu.Unlock()
+	if path == "" {
+		return nil
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("运行时已生效，但读配置失败: %w", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return fmt.Errorf("运行时已生效，但配置解析失败: %w", err)
+	}
+	for k, v := range patch {
+		m[k] = v
+	}
+	out, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		return err
+	}
+	out = append(out, '\n')
+	_ = os.WriteFile(path+".bak", raw, 0o600)
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, out, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, path)
+}
+
+// DialVia 通过指定出口建立 TCP 连接。e.Type=direct 表示本机直出。
+func DialVia(e Exit, host string, port int, timeout time.Duration, remoteDNS func() []string) (net.Conn, error) {
+	if e.Type == "socks5" {
+		return dialSocks5Timeout(e.Addr, host, port, timeout)
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return net.DialTimeout("tcp", net.JoinHostPort(host, itoa(port)), timeout)
+	}
+	ip, err := resolveA(remoteDNS(), host)
+	if err != nil {
+		return nil, err
+	}
+	return net.DialTimeout("tcp", net.JoinHostPort(ip.String(), itoa(port)), timeout)
+}
+
+// Probe 通过出口访问 ipify，拿出口公网 IP 与耗时。
+func (d *Dyn) Probe(name string) ProbeResult {
+	e := d.Resolve(name)
+	start := time.Now()
+	tr := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return DialVia(e, "api.ipify.org", 443, 8*time.Second, d.RemoteDNS)
+		},
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: false},
+	}
+	cli := &http.Client{Transport: tr, Timeout: 10 * time.Second}
+	res := ProbeResult{At: start}
+	resp, err := cli.Get("https://api.ipify.org")
+	if err != nil {
+		res.Err = err.Error()
+	} else {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 128))
+		resp.Body.Close()
+		res.IP = strings.TrimSpace(string(body))
+		if resp.StatusCode != 200 || res.IP == "" {
+			res.Err = fmt.Sprintf("HTTP %d", resp.StatusCode)
+		}
+	}
+	res.Latency = time.Since(start)
+	d.mu.Lock()
+	d.probe[name] = res
+	d.mu.Unlock()
+	return res
+}
+
+// ProbeCache 返回缓存的探测结果。
+func (d *Dyn) ProbeCache(name string) (ProbeResult, bool) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	r, ok := d.probe[name]
+	return r, ok
+}
+
+// ExitNames 返回排好序的出口名，实际按配置顺序。
+func (d *Dyn) ExitNames() []string {
+	exits := d.Exits()
+	out := make([]string, 0, len(exits))
+	for _, e := range exits {
+		out = append(out, e.Name)
+	}
+	return out
+}
+
+// sortExits 只用于测试里比较。
+func sortExits(in []Exit) []Exit {
+	out := append([]Exit{}, in...)
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
+}

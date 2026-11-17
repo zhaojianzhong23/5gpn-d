@@ -78,6 +78,8 @@ func TestQUICRelayEndToEnd(t *testing.T) {
 	cfg.GatewayIP = "127.0.0.1"
 	cfg.ClientCIDR = []string{"127.0.0.0/8"}
 	cfg.UpstreamDNS = []string{fake.LocalAddr().String()}
+	cfg.LocalDNS = []string{fake.LocalAddr().String()}
+	cfg.RemoteDNS = []string{fake.LocalAddr().String()}
 	cfg.QUIC.IdleSec = 5
 
 	relayConn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.ParseIP("127.0.0.1")})
@@ -89,6 +91,7 @@ func TestQUICRelayEndToEnd(t *testing.T) {
 		conn:  relayConn,
 		cfg:   cfg,
 		rules: func() *RuleSet { return rules },
+		dyn:   newDyn(cfg, ""),
 		nets:  cfg.ClientNets(),
 		idle:  5 * time.Second,
 		port:  srvPort,

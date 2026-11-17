@@ -16,14 +16,23 @@ import (
 
 // tgDeps 是 Bot 需要回调用到的运行时能力。
 type tgDeps struct {
-	Rules        func() *RuleSet
-	RefreshRules func() (*RuleSet, error)
-	Socks        func() string
-	SetSocks     func(string) error
-	Reload       func()
-	Started      time.Time
-	ProfileURL   string
-	GatewayIP    string
+	Dyn         *Dyn
+	Rules       func() *RuleSet
+	Refresh     func() (*RuleSet, error)
+	ReloadLocal func() error
+	RulesFile   string
+	Started     time.Time
+	Health      func() map[string]bool
+	QUICOn      bool
+	CertPath    string
+	ProfileURL  func() string
+}
+
+// tgsess 记录「等待用户输入」的多步操作。
+type tgsess struct {
+	kind  string
+	arg   string
+	msgID int64
 }
 
 type tgBot struct {
@@ -34,6 +43,7 @@ type tgBot struct {
 	mu    sync.Mutex
 	off   int64
 	state string
+	sess  map[int64]*tgsess
 }
 
 type tgAPIResp struct {
@@ -82,11 +92,26 @@ func startTelegram(cfg *Config, deps tgDeps) *tgBot {
 		api:   "https://api.telegram.org/bot" + cfg.Telegram.Token,
 		http:  &http.Client{Timeout: 45 * time.Second},
 		state: cfg.Telegram.StateFile,
+		sess:  map[int64]*tgsess{},
 	}
 	b.loadOffset()
 	go b.loop()
+	b.registerCommands()
 	logf("info", "Telegram Bot 已启动")
 	return b
+}
+
+// registerCommands 让输入框里的 / 菜单也有提示。
+func (b *tgBot) registerCommands() {
+	cmds := []map[string]string{
+		{"command": "menu", "description": "打开控制面板"},
+		{"command": "status", "description": "运行状态与负载"},
+		{"command": "exits", "description": "出口管理"},
+		{"command": "rules", "description": "分流管理"},
+		{"command": "manage", "description": "域名 / DNS / 证书"},
+		{"command": "id", "description": "查看我的 Telegram ID"},
+	}
+	_ = b.call("setMyCommands", map[string]any{"commands": cmds}, nil)
 }
 
 // Notify 主动推送到所有管理员。
@@ -179,6 +204,24 @@ func (b *tgBot) allowed(id int64) bool {
 	return false
 }
 
+func (b *tgBot) setSess(chatID int64, s *tgsess) {
+	b.mu.Lock()
+	b.sess[chatID] = s
+	b.mu.Unlock()
+}
+
+func (b *tgBot) getSess(chatID int64) *tgsess {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.sess[chatID]
+}
+
+func (b *tgBot) clearSess(chatID int64) {
+	b.mu.Lock()
+	delete(b.sess, chatID)
+	b.mu.Unlock()
+}
+
 func (b *tgBot) handle(u tgUpdate) {
 	if u.CallbackQuery != nil {
 		cq := u.CallbackQuery
@@ -186,11 +229,7 @@ func (b *tgBot) handle(u tgUpdate) {
 		if cq.Message != nil {
 			chatID, msgID = cq.Message.Chat.ID, cq.Message.MessageID
 		}
-		id := int64(0)
-		if cq.Message != nil {
-			id = cq.Message.Chat.ID
-		}
-		if !b.allowed(id) {
+		if !b.allowed(chatID) {
 			b.answerCallback(cq.ID, "无权限")
 			return
 		}
@@ -203,166 +242,91 @@ func (b *tgBot) handle(u tgUpdate) {
 	}
 	chatID := u.Message.Chat.ID
 	if !b.allowed(chatID) {
-		b.sendMessage(chatID, "未授权。把你的数字 ID 加到 config.json 的 telegram.admin_ids。", nil)
+		b.sendMessage(chatID, fmt.Sprintf("未授权。\n你的 ID 是 %d，把它加到 config.json 的 telegram.admin_ids 后重启。", chatID), nil)
 		return
 	}
 	text := strings.TrimSpace(u.Message.Text)
-	if i := strings.Index(text, "@"); i > 0 && strings.HasPrefix(text, "/") {
-		text = text[:i]
+	cmd := text
+	if i := strings.Index(cmd, "@"); i > 0 && strings.HasPrefix(cmd, "/") {
+		cmd = cmd[:i]
 	}
-	switch text {
-	case "/start", "/menu", "/help", "帮助":
-		b.sendMenu(chatID)
-	default:
-		b.sendMessage(chatID, "用 /start 打开面板。", nil)
+
+	switch cmd {
+	case "/start", "/menu", "/help":
+		b.clearSess(chatID)
+		b.sendPage(chatID, pageMain)
+		return
+	case "/status":
+		b.sendPage(chatID, pageStatus)
+		return
+	case "/exits":
+		b.sendPage(chatID, pageExits)
+		return
+	case "/rules":
+		b.sendPage(chatID, pageRules)
+		return
+	case "/manage":
+		b.sendPage(chatID, pageManage)
+		return
+	case "/id":
+		b.sendMessage(chatID, fmt.Sprintf("你的 Telegram ID：%d", chatID), nil)
+		return
+	case "/cancel":
+		b.clearSess(chatID)
+		b.sendMessage(chatID, "已取消。", nil)
+		return
 	}
-}
 
-func (b *tgBot) onCallback(chatID, msgID int64, data string) {
-	switch data {
-	case "status":
-		b.editMessage(chatID, msgID, b.statusText(), b.menuKeyboard())
-	case "rules":
-		rs, err := b.deps.RefreshRules()
-		if err != nil {
-			b.editMessage(chatID, msgID, "❌ 更新失败："+err.Error()+"\n（已保留原规则）", b.menuKeyboard())
-			return
-		}
-		b.editMessage(chatID, msgID, fmt.Sprintf("✅ 规则已更新\n共 %d 条\n时间 %s", rs.Count(), time.Now().Format("01-02 15:04")), b.menuKeyboard())
-	case "reload":
-		b.deps.Reload()
-		b.editMessage(chatID, msgID, "🔁 已重载规则", b.menuKeyboard())
-	case "exit":
-		s := b.deps.Socks()
-		b.editMessage(chatID, msgID, fmt.Sprintf("当前出口：%s", exitLabel(s)), b.exitKeyboard(s))
-	case "exit:direct":
-		if err := b.deps.SetSocks(""); err != nil {
-			b.editMessage(chatID, msgID, "❌ 切换失败："+err.Error(), b.menuKeyboard())
-			return
-		}
-		b.editMessage(chatID, msgID, "✅ 已切到「网关直连」\n新的连接立即生效，已建立的连接不受影响。", b.exitKeyboard(""))
-	case "exit:socks5":
-		s := b.cfg.Socks5
-		if s == "" {
-			b.editMessage(chatID, msgID, "配置里 socks5 为空，无法切回。\n请先在 /etc/dotmux/config.json 填 socks5 后重启。", b.exitKeyboard(""))
-			return
-		}
-		if err := b.deps.SetSocks(s); err != nil {
-			b.editMessage(chatID, msgID, "❌ 切换失败："+err.Error(), b.menuKeyboard())
-			return
-		}
-		b.editMessage(chatID, msgID, "✅ 已切到 "+exitLabel(s), b.exitKeyboard(s))
-	case "profile":
-		if b.deps.ProfileURL == "" {
-			b.editMessage(chatID, msgID, "未配置描述文件地址。\n在服务器上执行：\nbash scripts/make-profile.sh <域名> <IP> > dotmux.mobileconfig", b.menuKeyboard())
-			return
-		}
-		b.editMessage(chatID, msgID, "iOS 描述文件：\n"+b.deps.ProfileURL, b.menuKeyboard())
-	case "help":
-		b.editMessage(chatID, msgID, helpText(), b.menuKeyboard())
-	case "menu":
-		b.editMessage(chatID, msgID, b.statusText(), b.menuKeyboard())
-	default:
-		b.editMessage(chatID, msgID, b.statusText(), b.menuKeyboard())
+	// 非命令：看是不是在等输入
+	if s := b.getSess(chatID); s != nil {
+		b.onInput(chatID, s, text)
+		return
 	}
+	b.sendMessage(chatID, "用 /menu 打开控制面板。", nil)
 }
 
-func exitLabel(s string) string {
-	if s == "" {
-		return "网关直连（本机公网出口）"
-	}
-	return "SOCKS5 " + maskAddr(s)
+// sendPage 发送新消息渲染某个页面。
+func (b *tgBot) sendPage(chatID int64, p page) {
+	text, kb := b.render(p, "")
+	b.sendMessage(chatID, text, kb)
 }
 
-func maskAddr(s string) string {
-	if i := strings.LastIndex(s, "@"); i >= 0 {
-		return "***@" + s[i+1:]
-	}
-	return s
-}
-
-func (b *tgBot) statusText() string {
-	count := 0
-	if b.deps.Rules != nil {
-		if rs := b.deps.Rules(); rs != nil {
-			count = rs.Count()
-		}
-	}
-	socks := ""
-	if b.deps.Socks != nil {
-		socks = b.deps.Socks()
-	}
-	up := time.Since(b.deps.Started).Truncate(time.Second)
-	return fmt.Sprintf(
-		"dotmux  %s\n"+
-			"运行  %s\n"+
-			"规则  %d 条\n"+
-			"出口  %s\n"+
-			"网关  %s\n"+
-			"DoT   :853    QUIC  :443/udp",
-		version, up, count, exitLabel(socks), b.deps.GatewayIP)
-}
-
-func helpText() string {
-	return "按钮说明：\n" +
-		"📊 状态 —— 运行时长、规则条数、当前出口\n" +
-		"🔄 更新规则 —— 立即拉取远程规则，失败保留旧表\n" +
-		"⚙️ 出口 —— 在网关直连与 SOCKS5 之间切换\n" +
-		"📱 描述文件 —— 取 iOS 的 DoT 配置\n" +
-		"🔁 重载 —— 重新读取本地 rules.conf\n\n" +
-		"改规则：编辑 /etc/dotmux/rules.conf 后点重载\n" +
-		"改配置：编辑 config.json 后 systemctl restart dotmux"
-}
-
-func (b *tgBot) menuKeyboard() *tgKeyboard {
-	return &tgKeyboard{InlineKeyboard: [][]tgButton{
-		{{Text: "📊 状态", CallbackData: "status"}, {Text: "🔄 更新规则", CallbackData: "rules"}},
-		{{Text: "⚙️ 出口", CallbackData: "exit"}, {Text: "📱 描述文件", CallbackData: "profile"}},
-		{{Text: "🔁 重载", CallbackData: "reload"}, {Text: "❓ 帮助", CallbackData: "help"}},
-	}}
-}
-
-func (b *tgBot) exitKeyboard(cur string) *tgKeyboard {
-	mark := func(s string) string {
-		if s == cur {
-			return "✅ "
-		}
-		return ""
-	}
-	return &tgKeyboard{InlineKeyboard: [][]tgButton{
-		{{Text: mark("") + "网关直连", CallbackData: "exit:direct"}},
-		{{Text: mark("socks5") + "SOCKS5", CallbackData: "exit:socks5"}},
-		{{Text: "« 返回", CallbackData: "menu"}},
-	}}
-}
-
-func (b *tgBot) sendMenu(chatID int64) {
-	b.sendMessage(chatID, b.statusText(), b.menuKeyboard())
-}
-
-func (b *tgBot) sendMessage(chatID int64, text string, kb *tgKeyboard) {
-	p := map[string]any{"chat_id": chatID, "text": text, "disable_web_page_preview": true}
+func (b *tgBot) sendMessage(chatID int64, text string, kb *tgKeyboard) int64 {
+	p := map[string]any{"chat_id": chatID, "text": clip(text), "disable_web_page_preview": true}
 	if kb != nil {
 		p["reply_markup"] = kb
 	}
-	if err := b.call("sendMessage", p, nil); err != nil {
+	var res struct {
+		MessageID int64 `json:"message_id"`
+	}
+	if err := b.call("sendMessage", p, &res); err != nil {
 		logf("warn", "发送消息失败: %v", err)
 	}
+	return res.MessageID
 }
 
 func (b *tgBot) editMessage(chatID, msgID int64, text string, kb *tgKeyboard) {
 	p := map[string]any{
-		"chat_id": chatID, "message_id": msgID, "text": text,
+		"chat_id": chatID, "message_id": msgID, "text": clip(text),
 		"disable_web_page_preview": true,
 	}
 	if kb != nil {
 		p["reply_markup"] = kb
 	}
 	if err := b.call("editMessageText", p, nil); err != nil {
-		// 内容未变化时会报 "message is not modified"，忽略即可
 		if !strings.Contains(err.Error(), "not modified") {
 			logf("debug", "编辑消息失败: %v", err)
 		}
+	}
+}
+
+func (b *tgBot) sendPhoto(chatID int64, url, caption string) {
+	p := map[string]any{"chat_id": chatID, "photo": url}
+	if caption != "" {
+		p["caption"] = clip(caption)
+	}
+	if err := b.call("sendPhoto", p, nil); err != nil {
+		logf("warn", "发送二维码失败: %v", err)
 	}
 }
 
@@ -372,6 +336,15 @@ func (b *tgBot) answerCallback(id, text string) {
 		p["text"] = text
 	}
 	_ = b.call("answerCallbackQuery", p, nil)
+}
+
+// clip 防止超过 Telegram 4096 字符上限。
+func clip(s string) string {
+	const max = 3900
+	if len(s) <= max {
+		return s
+	}
+	return s[:max] + "\n…（已截断）"
 }
 
 func (b *tgBot) loadOffset() {
@@ -404,4 +377,18 @@ func (b *tgBot) saveOffset() {
 	if os.WriteFile(tmp, []byte(`{"offset":`+strconv.FormatInt(off, 10)+`}`), 0o644) == nil {
 		_ = os.Rename(tmp, b.state)
 	}
+}
+
+func exitLabel(e Exit) string {
+	if e.Type == "direct" {
+		return e.Name + "（本机直出）"
+	}
+	return e.Name + "（SOCKS5 " + maskAddr(e.Addr) + "）"
+}
+
+func maskAddr(s string) string {
+	if i := strings.LastIndex(s, "@"); i >= 0 {
+		return "***@" + s[i+1:]
+	}
+	return s
 }

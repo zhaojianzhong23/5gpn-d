@@ -17,17 +17,17 @@ import (
 type snipSvc struct {
 	cfg   *Config
 	rules func() *RuleSet
-	socks func() string
+	dyn   *Dyn
 	nets  []*net.IPNet
 }
 
-func newSnipSvc(cfg *Config, rules func() *RuleSet, socks func() string) *snipSvc {
-	return &snipSvc{cfg: cfg, rules: rules, socks: socks, nets: cfg.ClientNets()}
+func newSnipSvc(cfg *Config, rules func() *RuleSet, dyn *Dyn) *snipSvc {
+	return &snipSvc{cfg: cfg, rules: rules, dyn: dyn, nets: cfg.ClientNets()}
 }
 
 // startSNI 监听 443 / 80，按 SNI 或 Host 还原目标后转发。
-func startSNI(cfg *Config, rules func() *RuleSet, socks func() string) {
-	s := newSnipSvc(cfg, rules, socks)
+func startSNI(cfg *Config, rules func() *RuleSet, dyn *Dyn) error {
+	s := newSnipSvc(cfg, rules, dyn)
 	listeners := []struct {
 		addr  string
 		isTLS bool
@@ -35,6 +35,7 @@ func startSNI(cfg *Config, rules func() *RuleSet, socks func() string) {
 		{cfg.Listen.TLS, true},
 		{cfg.Listen.HTTP, false},
 	}
+	ok := 0
 	for _, l := range listeners {
 		if l.addr == "" {
 			continue
@@ -46,7 +47,12 @@ func startSNI(cfg *Config, rules func() *RuleSet, socks func() string) {
 		}
 		go s.acceptLoop(ln, l.isTLS)
 		logf("info", "SNI 转发监听 %s (tls=%v)", l.addr, l.isTLS)
+		ok++
 	}
+	if ok == 0 {
+		return errors.New("没有任何监听成功")
+	}
+	return nil
 }
 
 func (s *snipSvc) acceptLoop(ln net.Listener, isTLS bool) {
@@ -78,33 +84,39 @@ func (s *snipSvc) handle(c net.Conn, isTLS bool) {
 	remoteIP := remoteIPOf(c)
 	managed := inNets(remoteIP, s.nets)
 
-	if managed {
-		switch s.rules().Match(host) {
-		case ActionBlock:
-			logf("info", "block %s from %s", host, remoteIP)
-			return
-		}
-	}
-
 	port := 443
 	if !isTLS {
 		port = 80
 	}
-	var upstream net.Conn
-	if exit := s.socks(); exit != "" {
-		upstream, err = dialSocks5(exit, host, port)
-	} else {
-		upstream, err = s.dialResolved(host, port)
+
+	// 非托管来源一律直连，避免替别人家的流量做代理。
+	exit := Exit{Name: ExitDirect, Type: "direct"}
+	if managed {
+		act, target := ActionProxy, ""
+		if s.dyn.RoutingEnabled() {
+			act, target = s.rules().MatchRoute(host)
+		}
+		switch act {
+		case ActionBlock:
+			logf("info", "block %s from %s", host, remoteIP)
+			return
+		case ActionProxy:
+			exit = s.dyn.Resolve(target)
+		case ActionDirect:
+			exit = Exit{Name: ExitDirect, Type: "direct"}
+		}
 	}
+
+	upstream, err := DialVia(exit, host, port, 8*time.Second, s.dyn.RemoteDNS)
 	if err != nil {
-		logf("warn", "连接 %s:%d 失败: %v", host, port, err)
+		logf("warn", "连接 %s:%d（出口 %s）失败: %v", host, port, exit.Name, err)
 		return
 	}
 	defer upstream.Close()
 
 	_ = upstream.SetDeadline(time.Now().Add(2 * time.Minute))
 	pump(br, upstream, c)
-	logf("debug", "%s %s:%d %dms", classify(isTLS), host, port, time.Since(start).Milliseconds())
+	logf("debug", "%s %s:%d via %s %dms", classify(isTLS), host, port, exit.Name, time.Since(start).Milliseconds())
 }
 
 func classify(isTLS bool) string {
@@ -112,18 +124,6 @@ func classify(isTLS bool) string {
 		return "https"
 	}
 	return "http"
-}
-
-// dialResolved 用独立上游解析目标，避免系统 resolver 指回本机造成环路。
-func (s *snipSvc) dialResolved(host string, port int) (net.Conn, error) {
-	if ip := net.ParseIP(host); ip != nil {
-		return net.DialTimeout("tcp", net.JoinHostPort(host, itoa(port)), 8*time.Second)
-	}
-	ip, err := resolveA(s.cfg.UpstreamDNS, host)
-	if err != nil {
-		return nil, err
-	}
-	return net.DialTimeout("tcp", net.JoinHostPort(ip.String(), itoa(port)), 8*time.Second)
 }
 
 func resolveA(upstreams []string, host string) (net.IP, error) {
@@ -171,17 +171,31 @@ func peekHost(br *bufio.Reader, isTLS bool) (string, error) {
 		}
 		return parseClientHello(rec[5:])
 	}
-	// HTTP：渐进 Peek 到 header 结束，不消费字节
-	for n := 512; n <= 16384; n += 512 {
-		buf, err := br.Peek(n)
-		if len(buf) == 0 && err != nil {
+	// HTTP：逐步 Peek 到 header 结束，不消费字节。
+	// 不能一次 Peek 固定长度——短请求（不到那个长度）会一直等到超时。
+	have := 0
+	for {
+		if have >= 16384 {
+			return "", errors.New("HTTP header 过长")
+		}
+		// 多要一个字节即可触发底层读取，不会等满整个缓冲
+		if _, err := br.Peek(have + 1); err != nil {
+			if have == 0 {
+				return "", err
+			}
+			// 对端提前关了，用已读到的部分尝试解析
+			buf, _ := br.Peek(have)
+			if i := bytes.Index(buf, []byte("\r\n\r\n")); i >= 0 {
+				return parseHostHeader(buf[:i+4])
+			}
 			return "", err
 		}
+		have = br.Buffered()
+		buf, _ := br.Peek(have)
 		if i := bytes.Index(buf, []byte("\r\n\r\n")); i >= 0 {
 			return parseHostHeader(buf[:i+4])
 		}
 	}
-	return "", errors.New("HTTP header 过长")
 }
 
 func parseClientHello(b []byte) (string, error) {

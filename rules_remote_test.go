@@ -41,7 +41,7 @@ func TestRemoteRuleFormats(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rs, remote, err := LoadMergedRules(cfg)
+	rs, remote, err := LoadMergedRules(cfg, cfg.Rules.Remote)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestRemoteRuleCacheFallback(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	rs, _, err := LoadMergedRules(cfg)
+	rs, _, err := LoadMergedRules(cfg, cfg.Rules.Remote)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -102,7 +102,7 @@ func TestRemoteRuleCacheFallback(t *testing.T) {
 	}
 
 	// 上游开始报错，应落回缓存而不是把规则清零
-	rs2, _, err := LoadMergedRules(cfg)
+	rs2, _, err := LoadMergedRules(cfg, cfg.Rules.Remote)
 	if err != nil {
 		t.Fatal(err)
 	}

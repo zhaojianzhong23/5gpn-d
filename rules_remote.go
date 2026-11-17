@@ -17,18 +17,18 @@ const httpUA = "dotmux/0.2 (+https://github.com/zhaojianzhong23/dotmux)"
 
 // LoadMergedRules 先读本地规则（用户手写，优先级最高），再追加远程规则源，
 // 最后以本地文件的 FINAL 兜底。远程源失败不影响已加载的规则。
-func LoadMergedRules(cfg *Config) (*RuleSet, []Rule, error) {
-	return loadMerged(cfg, loadRemoteSource)
+func LoadMergedRules(cfg *Config, sources []RemoteSource) (*RuleSet, []Rule, error) {
+	return loadMerged(cfg, sources, loadRemoteSource)
 }
 
 // LoadMergedRulesCached 只用本地缓存，不联网——用于启动阶段，避免网络慢拖住进程。
-func LoadMergedRulesCached(cfg *Config) (*RuleSet, []Rule, error) {
-	return loadMerged(cfg, loadRemoteSourceCached)
+func LoadMergedRulesCached(cfg *Config, sources []RemoteSource) (*RuleSet, []Rule, error) {
+	return loadMerged(cfg, sources, loadRemoteSourceCached)
 }
 
 type sourceLoader func(RemoteSource, string) ([]Rule, error)
 
-func loadMerged(cfg *Config, loader sourceLoader) (*RuleSet, []Rule, error) {
+func loadMerged(cfg *Config, sources []RemoteSource, loader sourceLoader) (*RuleSet, []Rule, error) {
 	rs := &RuleSet{Final: ActionDirect}
 	if cfg.RulesFile != "" {
 		if _, err := os.Stat(cfg.RulesFile); err == nil {
@@ -38,6 +38,7 @@ func loadMerged(cfg *Config, loader sourceLoader) (*RuleSet, []Rule, error) {
 			}
 			rs.Rules = local.Rules
 			rs.Final = local.Final
+			rs.finalTarget = local.finalTarget
 		} else if !os.IsNotExist(err) {
 			return nil, nil, err
 		}
@@ -49,7 +50,7 @@ func loadMerged(cfg *Config, loader sourceLoader) (*RuleSet, []Rule, error) {
 	}
 
 	var remoteAll []Rule
-	for _, src := range cfg.Rules.Remote {
+	for _, src := range sources {
 		rules, err := loader(src, cfg.Rules.CacheDir)
 		if err != nil {
 			logf("warn", "规则源 %s 不可用: %v", src.Name, err)
@@ -73,24 +74,24 @@ func loadMerged(cfg *Config, loader sourceLoader) (*RuleSet, []Rule, error) {
 }
 
 // RefreshRules 重新拉取并原子替换规则集。
-func RefreshRules(cfg *Config, holder *ruleHolder) (*RuleSet, error) {
-	rs, remote, err := LoadMergedRules(cfg)
+func RefreshRules(cfg *Config, holder *ruleHolder, sources []RemoteSource) (*RuleSet, error) {
+	rs, remote, err := LoadMergedRules(cfg, sources)
 	if err != nil {
 		return nil, err
 	}
 	holder.setAll(rs, remote)
-	logf("info", "规则已刷新，共 %d 条（本地 + %d 个远程源）", rs.Count(), len(cfg.Rules.Remote))
+	logf("info", "规则已刷新，共 %d 条（本地 + %d 个远程源）", rs.Count(), len(sources))
 	return rs, nil
 }
 
 // StartRuleRefresher 按 refresh_hours 定时刷新规则。
-func StartRuleRefresher(cfg *Config, holder *ruleHolder, onChange func(*RuleSet)) {
-	if len(cfg.Rules.Remote) == 0 {
+func StartRuleRefresher(cfg *Config, holder *ruleHolder, sources func() []RemoteSource, onChange func(*RuleSet)) {
+	if len(sources()) == 0 {
 		return
 	}
 	go func() {
 		// 启动时先拉一次，让远程规则尽快生效
-		if rs, err := RefreshRules(cfg, holder); err == nil && onChange != nil {
+		if rs, err := RefreshRules(cfg, holder, sources()); err == nil && onChange != nil {
 			onChange(rs)
 		} else if err != nil {
 			logf("warn", "首次拉取远程规则失败: %v", err)
@@ -98,7 +99,7 @@ func StartRuleRefresher(cfg *Config, holder *ruleHolder, onChange func(*RuleSet)
 		t := time.NewTicker(time.Duration(cfg.Rules.RefreshHours) * time.Hour)
 		defer t.Stop()
 		for range t.C {
-			rs, err := RefreshRules(cfg, holder)
+			rs, err := RefreshRules(cfg, holder, sources())
 			if err != nil {
 				logf("warn", "定时刷新规则失败，保留旧规则: %v", err)
 				if onChange != nil {
@@ -136,7 +137,7 @@ func loadRemoteSourceCached(src RemoteSource, cacheDir string) ([]Rule, error) {
 }
 
 func parseRemoteBody(body []byte, src RemoteSource) ([]Rule, error) {
-	act, err := parseAction(src.Action)
+	act, target, err := parseActionTarget(src.Action)
 	if err != nil {
 		return nil, err
 	}
@@ -161,7 +162,7 @@ func parseRemoteBody(body []byte, src RemoteSource) ([]Rule, error) {
 
 	// clash 列表自带每条规则的类型，不能再用统一的 prefix 覆盖
 	if format == "clash" {
-		rules := parseClashRules(body, act)
+		rules := parseClashRules(body, act, target)
 		if len(rules) == 0 {
 			return nil, fmt.Errorf("解析结果为空（format=%s）", src.Format)
 		}
@@ -181,13 +182,13 @@ func parseRemoteBody(body []byte, src RemoteSource) ([]Rule, error) {
 
 	rules := make([]Rule, 0, len(domains))
 	for _, d := range domains {
-		rules = append(rules, Rule{Type: prefix, Value: d, Action: act})
+		rules = append(rules, Rule{Type: prefix, Value: d, Action: act, Target: target})
 	}
 	return rules, nil
 }
 
 // parseClashRules 保留列表里每条规则自己的类型。
-func parseClashRules(body []byte, act Action) []Rule {
+func parseClashRules(body []byte, act Action, target string) []Rule {
 	var out []Rule
 	for _, line := range strings.Split(string(body), "\n") {
 		line = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "-"))
@@ -206,10 +207,10 @@ func parseClashRules(body []byte, act Action) []Rule {
 		}
 		switch typ {
 		case "DOMAIN-KEYWORD":
-			out = append(out, Rule{Type: typ, Value: v, Action: act})
+			out = append(out, Rule{Type: typ, Value: v, Action: act, Target: target})
 		case "DOMAIN", "DOMAIN-SUFFIX":
 			if validDomain(v) {
-				out = append(out, Rule{Type: typ, Value: v, Action: act})
+				out = append(out, Rule{Type: typ, Value: v, Action: act, Target: target})
 			}
 		}
 	}
@@ -376,6 +377,7 @@ func ReloadLocalRules(cfg *Config, holder *ruleHolder) (*RuleSet, error) {
 	rules := append([]Rule{}, local.Rules...)
 	rules = append(rules, holder.remoteRules()...)
 	rs := newRuleSet(rules, local.Final)
+	rs.finalTarget = local.finalTarget
 	holder.set(rs)
 	logf("info", "本地规则已重载，共 %d 条", rs.Count())
 	return rs, nil

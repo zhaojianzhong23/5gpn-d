@@ -1,26 +1,22 @@
 {
-  "listen": {
-    "dot": ":853",
-    "tls": ":443",
-    "http": ":80"
-  },
+  "listen": { "dot": ":853", "tls": ":443", "http": ":80" },
+  "domain": "dot.example.com",
   "cert_file": "/etc/letsencrypt/live/dot.example.com/fullchain.pem",
   "key_file": "/etc/letsencrypt/live/dot.example.com/privkey.pem",
   "gateway_ip": "203.0.113.10",
-  "client_cidr": [
-    "172.22.0.0/16"
+  "client_cidr": ["172.22.0.0/16"],
+  "remote_dns": ["1.1.1.1", "8.8.8.8", "9.9.9.9"],
+  "local_dns": ["101.226.4.6", "218.30.118.6", "180.76.76.76", "119.29.29.29"],
+  "exits": [
+    { "name": "local", "type": "direct", "addr": "" },
+    { "name": "香港", "type": "socks5", "addr": "user:pass@1.2.3.4:1080" }
   ],
-  "upstream_dns": [
-    "223.5.5.5:53",
-    "119.29.29.29:53"
-  ],
-  "socks5": "127.0.0.1:1080",
+  "default_exit": "香港",
+  "routing_enabled": true,
   "rules_file": "/etc/dotmux/rules.conf",
   "cache_size": 8192,
   "synthetic_ttl": 60,
-  "log": {
-    "level": "info"
-  },
+  "log": { "level": "info" },
   "rules": {
     "refresh_hours": 24,
     "cache_dir": "/var/lib/dotmux/rules",
@@ -35,16 +31,10 @@
     ]
   },
   "telegram": {
-    "token": "123456:replace-me",
-    "admin_ids": [
-      123456789
-    ],
+    "token": "",
+    "admin_ids": [],
     "state_file": "/var/lib/dotmux/tg-state.json",
-    "profile_url": "https://dot.example.com/ios-dot.mobileconfig"
+    "profile_url": ""
   },
-  "quic": {
-    "enabled": true,
-    "listen": ":443",
-    "idle_sec": 30
-  }
+  "quic": { "enabled": true, "listen": ":443", "idle_sec": 30 }
 }

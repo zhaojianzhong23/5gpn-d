@@ -12,12 +12,18 @@ import (
 // Config 是 /etc/dotmux/config.json 的结构。
 type Config struct {
 	Listen       Listen    `json:"listen"`
+	Domain       string    `json:"domain"`
 	CertFile     string    `json:"cert_file"`
 	KeyFile      string    `json:"key_file"`
 	GatewayIP    string    `json:"gateway_ip"`
 	ClientCIDR   []string  `json:"client_cidr"`
 	UpstreamDNS  []string  `json:"upstream_dns"`
+	RemoteDNS    []string  `json:"remote_dns"`
+	LocalDNS     []string  `json:"local_dns"`
 	Socks5       string    `json:"socks5"`
+	Exits        []Exit    `json:"exits"`
+	DefaultExit  string    `json:"default_exit"`
+	Routing      bool      `json:"routing_enabled"`
 	RulesFile    string    `json:"rules_file"`
 	CacheSize    int       `json:"cache_size"`
 	SyntheticTTL uint32    `json:"synthetic_ttl"`
@@ -37,6 +43,13 @@ type LogConfig struct {
 	Level string `json:"level"`
 }
 
+// Exit 是一个流量出口。type=direct 表示本机直连（忽略 addr）。
+type Exit struct {
+	Name string `json:"name"`
+	Type string `json:"type"` // direct | socks5
+	Addr string `json:"addr"` // socks5: [user:pass@]host:port
+}
+
 // RulesConf 描述远程规则源。
 type RulesConf struct {
 	Remote       []RemoteSource `json:"remote"`
@@ -48,7 +61,7 @@ type RulesConf struct {
 type RemoteSource struct {
 	URL    string `json:"url"`
 	Format string `json:"format"` // domain | gfwlist | clash | auto
-	Action string `json:"action"` // proxy | direct | block
+	Action string `json:"action"` // proxy[:出口] | direct | block
 	Prefix string `json:"prefix"` // DOMAIN-SUFFIX（默认）| DOMAIN | DOMAIN-KEYWORD
 	Name   string `json:"name"`
 }
@@ -66,6 +79,9 @@ type QUICConf struct {
 	IdleSec int    `json:"idle_sec"`
 }
 
+// ExitDirect 是内置直连出口的默认名字。
+const ExitDirect = "local"
+
 func defaultConfig() *Config {
 	c := &Config{}
 	c.Listen.DoT = ":853"
@@ -75,6 +91,11 @@ func defaultConfig() *Config {
 	c.KeyFile = "/etc/letsencrypt/live/gateway.example.com/privkey.pem"
 	c.ClientCIDR = []string{"172.22.0.0/16"}
 	c.UpstreamDNS = []string{"223.5.5.5:53", "119.29.29.29:53"}
+	c.LocalDNS = []string{"101.226.4.6", "218.30.118.6", "180.76.76.76", "119.29.29.29"}
+	c.RemoteDNS = []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"}
+	c.Exits = []Exit{{Name: ExitDirect, Type: "direct"}}
+	c.DefaultExit = ExitDirect
+	c.Routing = true
 	c.RulesFile = "/etc/dotmux/rules.conf"
 	c.CacheSize = 8192
 	c.SyntheticTTL = 60
@@ -85,6 +106,24 @@ func defaultConfig() *Config {
 	c.QUIC.Listen = ":443"
 	c.QUIC.IdleSec = 30
 	return c
+}
+
+// UnmarshalJSON 兼容旧配置：只写了 upstream_dns 时，把它当作国内 DNS 池。
+func (c *Config) UnmarshalJSON(b []byte) error {
+	type alias Config
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	if err := json.Unmarshal(b, (*alias)(c)); err != nil {
+		return err
+	}
+	if _, ok := raw["local_dns"]; !ok {
+		if _, ok := raw["upstream_dns"]; ok {
+			c.LocalDNS = append([]string{}, c.UpstreamDNS...)
+		}
+	}
+	return nil
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -98,10 +137,35 @@ func loadConfig(path string) (*Config, error) {
 			return nil, fmt.Errorf("解析配置失败: %w", err)
 		}
 	}
+	cfg.migrate()
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+// migrate 把旧版单出口配置升级成出口表，保证老配置文件直接可用。
+func (c *Config) migrate() {
+	if c.Socks5 != "" {
+		found := false
+		for _, e := range c.Exits {
+			if e.Name == "proxy" {
+				found = true
+			}
+		}
+		if !found {
+			c.Exits = append(c.Exits, Exit{Name: "proxy", Type: "socks5", Addr: c.Socks5})
+		}
+		if c.DefaultExit == "" || c.DefaultExit == ExitDirect {
+			c.DefaultExit = "proxy"
+		}
+	}
+	if len(c.Exits) == 0 {
+		c.Exits = []Exit{{Name: ExitDirect, Type: "direct"}}
+	}
+	if c.DefaultExit == "" {
+		c.DefaultExit = c.Exits[0].Name
+	}
 }
 
 func (c *Config) validate() error {
@@ -114,14 +178,19 @@ func (c *Config) validate() error {
 	if c.Listen.DoT == "" {
 		return errors.New("listen.dot 不能为空")
 	}
-	if len(c.UpstreamDNS) == 0 {
-		return errors.New("upstream_dns 不能为空")
+	if len(c.LocalDNS) == 0 {
+		c.LocalDNS = c.UpstreamDNS
 	}
-	for i, u := range c.UpstreamDNS {
-		if !strings.Contains(u, ":") {
-			c.UpstreamDNS[i] = u + ":53"
-		}
+	if len(c.LocalDNS) == 0 {
+		return errors.New("local_dns 不能为空")
 	}
+	if len(c.RemoteDNS) == 0 {
+		c.RemoteDNS = append([]string{}, c.LocalDNS...)
+	}
+	c.LocalDNS = normalizeDNS(c.LocalDNS)
+	c.RemoteDNS = normalizeDNS(c.RemoteDNS)
+	c.UpstreamDNS = c.LocalDNS
+
 	for _, n := range c.ClientCIDR {
 		if _, err := parseCIDR(n); err != nil {
 			return fmt.Errorf("client_cidr 非法: %s", n)
@@ -148,6 +217,12 @@ func (c *Config) validate() error {
 	if c.QUIC.IdleSec <= 0 {
 		c.QUIC.IdleSec = 30
 	}
+	if c.Domain == "" {
+		c.Domain = domainFromCertPath(c.CertFile)
+	}
+	if err := c.validateExits(); err != nil {
+		return err
+	}
 	for i := range c.Rules.Remote {
 		r := &c.Rules.Remote[i]
 		if r.URL == "" {
@@ -169,6 +244,57 @@ func (c *Config) validate() error {
 	return nil
 }
 
+func (c *Config) validateExits() error {
+	seen := map[string]bool{}
+	hasDirect := false
+	for i := range c.Exits {
+		e := &c.Exits[i]
+		e.Name = strings.TrimSpace(e.Name)
+		e.Type = strings.ToLower(strings.TrimSpace(e.Type))
+		if e.Name == "" {
+			return fmt.Errorf("exits[%d].name 不能为空", i)
+		}
+		if strings.ContainsAny(e.Name, " ,\t\n") {
+			return fmt.Errorf("出口名不能包含空格或逗号: %q", e.Name)
+		}
+		if seen[e.Name] {
+			return fmt.Errorf("出口名重复: %s", e.Name)
+		}
+		seen[e.Name] = true
+		if e.Type == "" {
+			e.Type = "direct"
+		}
+		switch e.Type {
+		case "direct":
+			hasDirect = true
+			e.Addr = ""
+		case "socks5":
+			if e.Addr == "" {
+				return fmt.Errorf("出口 %s 缺少 addr", e.Name)
+			}
+		default:
+			return fmt.Errorf("出口 %s 类型不支持: %s（仅 direct / socks5）", e.Name, e.Type)
+		}
+	}
+	if !hasDirect {
+		return errors.New("至少需要一个 direct 出口，否则切不回来")
+	}
+	if c.DefaultExit != "" && !seen[c.DefaultExit] {
+		return fmt.Errorf("default_exit 指向不存在的出口: %s", c.DefaultExit)
+	}
+	return nil
+}
+
+// FindExit 按名字取出口，nil 表示没有这个出口。
+func (c *Config) FindExit(name string) *Exit {
+	for i := range c.Exits {
+		if c.Exits[i].Name == name {
+			return &c.Exits[i]
+		}
+	}
+	return nil
+}
+
 // ClientNets 返回解析后的客户端网段，用于判断“是否给自己的设备服务”。
 func (c *Config) ClientNets() []*net.IPNet {
 	var out []*net.IPNet
@@ -179,6 +305,31 @@ func (c *Config) ClientNets() []*net.IPNet {
 		}
 	}
 	return out
+}
+
+func normalizeDNS(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, u := range in {
+		u = strings.TrimSpace(u)
+		if u == "" {
+			continue
+		}
+		if !strings.Contains(u, ":") {
+			u += ":53"
+		}
+		out = append(out, u)
+	}
+	return out
+}
+
+func domainFromCertPath(p string) string {
+	parts := strings.Split(p, "/")
+	for i, s := range parts {
+		if s == "live" && i+1 < len(parts) {
+			return parts[i+1]
+		}
+	}
+	return ""
 }
 
 func parseCIDR(s string) (*net.IPNet, error) {
