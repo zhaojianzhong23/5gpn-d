@@ -8,8 +8,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -36,6 +38,8 @@ type Dyn struct {
 type ProbeResult struct {
 	IP      string
 	Latency time.Duration
+	Dial    time.Duration // TCP 建连（走 socks5 时含代理握手）
+	TLS     time.Duration // TLS 握手
 	Err     string
 	At      time.Time
 }
@@ -516,19 +520,62 @@ func DialVia(e Exit, host string, port int, timeout time.Duration, remoteDNS fun
 	return net.DialTimeout("tcp", net.JoinHostPort(ip.String(), itoa(port)), timeout)
 }
 
+// 探测目标。做成变量只为让测试能指向本地 TLS 服务，
+// 生产路径永远是 api.ipify.org:443。
+var (
+	probeTarget = "api.ipify.org:443"
+	probeVerify = true
+)
+
 // Probe 通过出口访问 ipify，拿出口公网 IP 与耗时。
+//
+// 注意这个耗时是「本机 → 出口 → api.ipify.org → 回来」的全程：
+// 建连（含 socks5 握手）+ TLS 握手 + 首个响应字节，跟手机到本机的
+// 内网延迟完全是两回事，Bot 里要分开说明，否则很容易误读。
 func (d *Dyn) Probe(name string) ProbeResult {
 	e := d.Resolve(name)
 	start := time.Now()
+	var dial, tlsHs time.Duration
+
+	host, portStr, _ := net.SplitHostPort(probeTarget)
+	port, perr := strconv.Atoi(portStr)
+	if perr != nil {
+		port = 443
+	}
+
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			return DialVia(e, "api.ipify.org", 443, 8*time.Second, d.RemoteDNS)
+			c, derr := DialVia(e, host, port, 8*time.Second, d.RemoteDNS)
+			if derr == nil {
+				dial = time.Since(start)
+			}
+			return c, derr
 		},
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: false},
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: !probeVerify},
 	}
 	cli := &http.Client{Transport: tr, Timeout: 10 * time.Second}
 	res := ProbeResult{At: start}
-	resp, err := cli.Get("https://api.ipify.org")
+
+	req, rerr := http.NewRequest("GET", "https://"+probeTarget, nil)
+	var (
+		resp *http.Response
+		err  error
+	)
+	if rerr != nil {
+		err = rerr
+	} else {
+		var tlsStart time.Time
+		req = req.WithContext(httptrace.WithClientTrace(req.Context(), &httptrace.ClientTrace{
+			TLSHandshakeStart: func() { tlsStart = time.Now() },
+			TLSHandshakeDone: func(cs tls.ConnectionState, herr error) {
+				if herr == nil && !tlsStart.IsZero() {
+					tlsHs = time.Since(tlsStart)
+				}
+			},
+		}))
+		resp, err = cli.Do(req)
+	}
+
 	if err != nil {
 		res.Err = err.Error()
 	} else {
@@ -539,6 +586,7 @@ func (d *Dyn) Probe(name string) ProbeResult {
 			res.Err = fmt.Sprintf("HTTP %d", resp.StatusCode)
 		}
 	}
+	res.Dial, res.TLS = dial, tlsHs
 	res.Latency = time.Since(start)
 	d.mu.Lock()
 	d.probe[name] = res

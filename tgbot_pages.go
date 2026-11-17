@@ -187,6 +187,23 @@ func (b *tgBot) renderStatus() (string, *tgKeyboard) {
 	})
 }
 
+// probeTiming 把一次探测的耗时拆开呈现。
+//
+// 这三个数全是「本机 → 出口 → api.ipify.org」的往返：建连含 socks5 握手，
+// TLS 是握手本身，合计还含一次 HTTP 请求和读回包。跟手机到本机的内网
+// 延迟是两回事（那一段只有手机自己 ping 才测得到），所以要在界面上写清楚。
+func probeTiming(r ProbeResult) string {
+	parts := []string{r.IP}
+	if r.Dial > 0 {
+		parts = append(parts, fmt.Sprintf("建连 %dms", r.Dial.Milliseconds()))
+	}
+	if r.TLS > 0 {
+		parts = append(parts, fmt.Sprintf("TLS %dms", r.TLS.Milliseconds()))
+	}
+	parts = append(parts, fmt.Sprintf("合计 %dms", r.Latency.Milliseconds()))
+	return strings.Join(parts, " · ")
+}
+
 func (b *tgBot) renderExits() (string, *tgKeyboard) {
 	dyn := b.deps.Dyn
 	exits := dyn.Exits()
@@ -199,7 +216,7 @@ func (b *tgBot) renderExits() (string, *tgKeyboard) {
 		if pr.Err != "" {
 			sb.WriteString(fmt.Sprintf("出口 IP：探测失败（%s）\n", pr.Err))
 		} else {
-			sb.WriteString(fmt.Sprintf("出口 IP：%s（%dms）\n", pr.IP, pr.Latency.Milliseconds()))
+			sb.WriteString("出口 IP：" + probeTiming(pr) + "\n")
 		}
 	} else {
 		sb.WriteString("出口 IP：未探测，点下方「检查出口连通性」\n")
@@ -506,7 +523,9 @@ func (b *tgBot) onCallback(chatID, msgID int64, data string) {
 		b.editMessage(chatID, msgID, "🔍 正在并发探测所有出口，最多 16 秒…", nil)
 		lines, _ := b.probeAll()
 		text, kb := b.renderExits()
-		b.editMessage(chatID, msgID, text+"\n\n探测结果：\n"+strings.Join(lines, "\n"), kb)
+		b.editMessage(chatID, msgID, text+"\n\n探测结果：\n"+strings.Join(lines, "\n")+
+			"\n\n💡 上面的耗时是本机经该出口访问 api.ipify.org 的往返（建连 + TLS + 首包），"+
+			"不含手机到本机这一段。要看内网延迟，在手机上 ping 网关 IP 更准。", kb)
 	case strings.HasPrefix(data, "x:use:"):
 		name := strings.TrimPrefix(data, "x:use:")
 		if err := dyn.SetDefault(name); err != nil {
@@ -532,7 +551,7 @@ func (b *tgBot) onCallback(chatID, msgID int64, data string) {
 		res := dyn.Probe(name)
 		msg := fmt.Sprintf("🔍 %s：失败 %s", name, res.Err)
 		if res.Err == "" {
-			msg = fmt.Sprintf("🔍 %s：%s（%dms）", name, res.IP, res.Latency.Milliseconds())
+			msg = "🔍 " + name + "：" + probeTiming(res)
 		}
 		text, kb := b.renderExits()
 		b.editMessage(chatID, msgID, msg+"\n\n"+text, kb)
@@ -556,10 +575,31 @@ func (b *tgBot) onCallback(chatID, msgID int64, data string) {
 				"例：\nopenai.com\nopenai.com 香港\n\n"+
 				"不写出口就走默认出口；默认按 DOMAIN-SUFFIX 匹配（含子域名）。\n发 /cancel 取消。")
 	case data == "r:addset":
-		b.askInput(chatID, msgID, "add_set", "",
-			"➕ 添加规则集\n\n发一条消息：\n<URL> [名字]\n\n"+
-				"例：\nhttps://example.com/gfw.txt gfw\n\n"+
-				"默认按 domain 格式解析，动作 proxy（走默认出口）。\n发 /cancel 取消。")
+		b.editMessage(chatID, msgID, "➕ 添加规则集\n\n先选列表格式——选错了会解析出 0 条，"+
+			"而页面只会显示「远程规则集 +1」、总数不动，很难看出来。\n\n"+
+			"🤖 自动识别：按内容判断，拿不准就用这个\n"+
+			"📋 clash：每行 `- DOMAIN-SUFFIX,example.com`\n"+
+			"🔒 gfwlist：base64 编码，或 adblock 语法 `||example.com^`\n"+
+			"📄 纯域名：一行一个域名", &tgKeyboard{InlineKeyboard: [][]tgButton{
+			{{Text: "🤖 自动识别", CallbackData: "r:addset:auto"}},
+			{{Text: "📋 clash 格式", CallbackData: "r:addset:clash"}},
+			{{Text: "🔒 gfwlist 格式", CallbackData: "r:addset:gfwlist"}},
+			{{Text: "📄 纯域名列表", CallbackData: "r:addset:domain"}},
+			{{Text: "« 返回", CallbackData: "r"}},
+		}})
+	case strings.HasPrefix(data, "r:addset:"):
+		fmtName := strings.TrimPrefix(data, "r:addset:")
+		hint := map[string]string{
+			"auto":    "按内容判断：含 DOMAIN- 走 clash，base64 走 gfwlist，其余按纯域名。",
+			"clash":   "每行形如 `- DOMAIN-SUFFIX,example.com`，规则类型取行内自带的。",
+			"gfwlist": "base64 编码的 gfwlist，或 adblock 语法（`||example.com^`）。",
+			"domain":  "一行一个域名，统一按 DOMAIN-SUFFIX 匹配。",
+		}[fmtName]
+		b.askInput(chatID, msgID, "add_set", fmtName,
+			"➕ 添加规则集（格式 "+fmtName+"）\n\n"+hint+"\n\n"+
+				"发一条消息：\n<URL> [名字]\n\n"+
+				"例：\nhttps://example.com/proxy.txt proxy\n\n"+
+				"不写名字会自动命名；动作 proxy（走默认出口）。\n发 /cancel 取消。")
 	case data == "r:up":
 		b.editMessage(chatID, msgID, "🔄 正在拉取规则…", nil)
 		rs, err := b.deps.Refresh()
@@ -716,7 +756,7 @@ func (b *tgBot) probeAll() ([]string, map[string]ProbeResult) {
 			if it.res.Err != "" {
 				lines = append(lines, fmt.Sprintf("❌ %s：%s", it.name, clipErr(it.res.Err)))
 			} else {
-				lines = append(lines, fmt.Sprintf("✅ %s：%s（%dms）", it.name, it.res.IP, it.res.Latency.Milliseconds()))
+				lines = append(lines, "✅ "+it.name+"："+probeTiming(it.res))
 			}
 		case <-deadline:
 			lines = append(lines, "⌛ 部分出口探测超时")
@@ -737,6 +777,10 @@ func clipErr(s string) string {
 // ---------- 输入处理 ----------
 
 func (b *tgBot) onInput(chatID int64, s *tgsess, text string) {
+	if s == nil {
+		b.sendMessage(chatID, "会话已过期，重新点一次按钮。", nil)
+		return
+	}
 	text = strings.TrimSpace(text)
 	if text == "" {
 		b.sendMessage(chatID, "空消息，重发一次或 /cancel。", nil)
@@ -806,8 +850,16 @@ func (b *tgBot) onInput(chatID int64, s *tgsess, text string) {
 		if name == "" {
 			name = "set" + strconv.Itoa(len(b.deps.Dyn.Sources())+1)
 		}
+		fmtName := s.arg
+		if fmtName == "" {
+			fmtName = "auto"
+		}
+		before := 0
+		if cur := b.deps.Rules(); cur != nil {
+			before = cur.Count()
+		}
 		src := RemoteSource{
-			Name: name, URL: u, Format: "auto", Prefix: "DOMAIN-SUFFIX", Action: "proxy",
+			Name: name, URL: u, Format: fmtName, Prefix: "DOMAIN-SUFFIX", Action: "proxy",
 		}
 		if err := b.deps.Dyn.AddSource(src); err != nil {
 			b.sendMessage(chatID, "❌ "+err.Error(), nil)
@@ -818,7 +870,21 @@ func (b *tgBot) onInput(chatID int64, s *tgsess, text string) {
 			b.sendMessage(chatID, "⚠️ 规则集已保存，但首次拉取失败："+err.Error(), backOnly())
 			return
 		}
-		b.sendMessage(chatID, fmt.Sprintf("✅ 规则集 %s 已添加，规则现共 %d 条", name, rs.Count()), backOnly(
+		added := rs.Count() - before
+		if added <= 0 {
+			// 拉到了但一条也没解析出来，基本都是格式选错，必须明说，
+			// 否则页面上只显示「远程规则集 +1」、总数不动，看不出来。
+			b.sendMessage(chatID, fmt.Sprintf(
+				"⚠️ 规则集 %s 已保存，但按 %s 格式解析出 0 条。\n\n"+
+					"多半是格式选错了：这份列表如果是 clash 语法（每行 - DOMAIN-SUFFIX,xxx），"+
+					"选「纯域名」就会全军覆没。\n\n"+
+					"处理：📚 规则集 → 🗑 删规则集 删掉它，再重新添加并选对格式。",
+				name, fmtName), backOnly(
+				[]tgButton{{Text: "📚 规则集", CallbackData: "r:set"}}))
+			return
+		}
+		b.sendMessage(chatID, fmt.Sprintf("✅ 规则集 %s 已添加（格式 %s），解析出 %d 条，规则现共 %d 条",
+			name, fmtName, added, rs.Count()), backOnly(
 			[]tgButton{{Text: "📚 规则集", CallbackData: "r:set"}}))
 
 	case "set_domain":
