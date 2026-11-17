@@ -16,7 +16,11 @@ type Config struct {
 	Domain    string `json:"domain"`
 	CertFile  string `json:"cert_file"`
 	KeyFile   string `json:"key_file"`
-	GatewayIP string `json:"gateway_ip"`
+	// ACMEWebroot 是 80 端口上 /.well-known/acme-challenge/ 的取文件目录。
+	// 有它就不用为了续期停服务：certbot 走 --webroot，dotmux 自己把 challenge 吐出去，
+	// 不会出现「按 Host 转发 → 转给自己 → 死循环」。
+	ACMEWebroot string `json:"acme_webroot"`
+	GatewayIP   string `json:"gateway_ip"`
 	// gatewayAuto 记录网关地址是自动探测来的，仅用于启动日志，不参与序列化。
 	gatewayAuto bool     `json:"-"`
 	ClientCIDR  []string `json:"client_cidr"`
@@ -123,6 +127,7 @@ func defaultConfig() *Config {
 	c.Listen.HTTP = ":80"
 	c.CertFile = "/etc/letsencrypt/live/gateway.example.com/fullchain.pem"
 	c.KeyFile = "/etc/letsencrypt/live/gateway.example.com/privkey.pem"
+	c.ACMEWebroot = "/var/www/html"
 	c.ClientCIDR = []string{"172.22.0.0/16"}
 	c.ECS = "139.226.48.1"
 	c.MihomoBin = "/usr/local/bin/mihomo"
