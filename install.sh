@@ -446,6 +446,7 @@ else
   "rules_file": "$RULES",
   "cache_size": 8192,
   "synthetic_ttl": 60,
+  "cache_min_ttl": 600,
   "log": { "level": "info" },
   "rules": {
     "refresh_hours": 24,

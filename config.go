@@ -28,17 +28,22 @@ type Config struct {
 	LocalDNS    []string `json:"local_dns"`
 	Socks5      string   `json:"socks5"`
 	// MihomoBin 是代理内核路径，type=mihomo 的出口靠它落地成 socks5。
-	MihomoBin    string    `json:"mihomo_bin"`
-	Exits        []Exit    `json:"exits"`
-	DefaultExit  string    `json:"default_exit"`
-	Routing      bool      `json:"routing_enabled"`
-	RulesFile    string    `json:"rules_file"`
-	CacheSize    int       `json:"cache_size"`
-	SyntheticTTL uint32    `json:"synthetic_ttl"`
-	Log          LogConfig `json:"log"`
-	Rules        RulesConf `json:"rules"`
-	Telegram     TGConf    `json:"telegram"`
-	QUIC         QUICConf  `json:"quic"`
+	MihomoBin    string `json:"mihomo_bin"`
+	Exits        []Exit `json:"exits"`
+	DefaultExit  string `json:"default_exit"`
+	Routing      bool   `json:"routing_enabled"`
+	RulesFile    string `json:"rules_file"`
+	CacheSize    int    `json:"cache_size"`
+	SyntheticTTL uint32 `json:"synthetic_ttl"`
+	// CacheMinTTL 是直连记录在网关侧的最短缓存秒数。上游 TTL 常只有 60s，
+	// 会和手机缓存同时失效，导致每次都要跨境回源；延长这一侧缓存后，
+	// 手机再查时直接命中，只有手机到网关这一次往返。
+	// 对外作答的 TTL 仍不超过上游原值，客户端的缓存行为不变。
+	CacheMinTTL uint32    `json:"cache_min_ttl"`
+	Log         LogConfig `json:"log"`
+	Rules       RulesConf `json:"rules"`
+	Telegram    TGConf    `json:"telegram"`
+	QUIC        QUICConf  `json:"quic"`
 }
 
 type Listen struct {
@@ -130,6 +135,7 @@ func defaultConfig() *Config {
 	c.RulesFile = "/etc/dotmux/rules.conf"
 	c.CacheSize = 8192
 	c.SyntheticTTL = 60
+	c.CacheMinTTL = 600
 	c.Log.Level = "info"
 	c.Rules.RefreshHours = 24
 	c.Rules.CacheDir = "/var/lib/dotmux/rules"

@@ -19,6 +19,9 @@ type dnsCache struct {
 type cacheEntry struct {
 	msg *dns.Msg
 	exp time.Time
+	// ttl 是上游给的最小 TTL，对外作答时 TTL 不超过它，
+	// 这样网关侧可以缓存更久而不改变客户端的缓存策略。
+	ttl uint32
 }
 
 func newDNSCache(max int) *dnsCache {
@@ -38,11 +41,27 @@ func (c *dnsCache) get(key string) *dns.Msg {
 		}
 		return nil
 	}
-	return e.msg.Copy()
+	m := e.msg.Copy()
+	// 剩余存活时间，但不超过上游原本给的 TTL，避免让客户端缓存过久。
+	left := uint32(time.Until(e.exp).Seconds())
+	if left < 1 {
+		left = 1
+	}
+	if e.ttl > 0 && left > e.ttl {
+		left = e.ttl
+	}
+	for _, rr := range m.Answer {
+		if h := rr.Header(); h.Rrtype != dns.TypeOPT && h.Ttl > left {
+			h.Ttl = left
+		}
+	}
+	return m
 }
 
-func (c *dnsCache) put(key string, msg *dns.Msg, ttl uint32) {
-	if c == nil || c.max == 0 || ttl == 0 {
+// put 写入缓存。cacheFor 是网关侧的存活秒数，origTTL 是上游原 TTL，
+// 后者用于对外作答时限制 TTL，两者可以不同。
+func (c *dnsCache) put(key string, msg *dns.Msg, cacheFor, origTTL uint32) {
+	if c == nil || c.max == 0 || cacheFor == 0 {
 		return
 	}
 	c.mu.Lock()
@@ -59,7 +78,7 @@ func (c *dnsCache) put(key string, msg *dns.Msg, ttl uint32) {
 			c.m = make(map[string]cacheEntry)
 		}
 	}
-	c.m[key] = cacheEntry{msg: msg.Copy(), exp: time.Now().Add(time.Duration(ttl) * time.Second)}
+	c.m[key] = cacheEntry{msg: msg.Copy(), exp: time.Now().Add(time.Duration(cacheFor) * time.Second), ttl: origTTL}
 }
 
 type dnsSvc struct {
@@ -179,7 +198,12 @@ func (s *dnsSvc) forward(w dns.ResponseWriter, req *dns.Msg, useECS bool) {
 		return
 	}
 	resp.Id = req.Id
-	s.cache.put(key, resp, minTTL(resp))
+	ttl := minTTL(resp)
+	cacheFor := ttl
+	if f := s.cfg.CacheMinTTL; f > cacheFor {
+		cacheFor = f
+	}
+	s.cache.put(key, resp, cacheFor, ttl)
 	_ = w.WriteMsg(resp)
 }
 

@@ -128,6 +128,7 @@ sudo bash uninstall.sh
 | `default_exit` | 默认出口名；`direct` 规则之外的流量都走这里 |
 | `routing_enabled` | 分流开关，关掉等于全部走默认出口 |
 | `cache_size` / `synthetic_ttl` | DNS 缓存条数 / 改写记录 TTL |
+| `cache_min_ttl` | 直连记录在网关侧的最短缓存秒数，默认 600；对外作答的 TTL 仍不超过上游原值，客户端行为不变 |
 | `rules.remote[]` | 远程规则源：`url`、`format`、`prefix`、`action`（可为 `proxy:出口名`）、`name` |
 | `rules.refresh_hours` | 自动刷新间隔，默认 24 |
 | `rules.cache_dir` | 拉取失败时的回退缓存目录 |
@@ -256,6 +257,17 @@ bash scripts/make-profile.sh dot.example.com 203.0.113.10 > dotmux.mobileconfig
 ```
 
 传到手机安装（AirDrop / 网页 / 邮件）。装完在 设置 → 通用 → VPN 与设备管理 里确认。描述文件全局生效；想只在蜂窝数据下启用，需要自己加 `OnDemandRules`。
+
+### 国内域名为什么也要走一次网关
+
+私人 DNS（DoT）是**全局单条**，系统的设置里没有「国内走运营商、国外走网关」这种选项。所以任何域名解析都先发给网关，由网关判定走哪条路：
+
+- 判 `proxy` 的域名：直接返回网关地址，**不查上游**，几乎零延迟；
+- 判 `direct` 的域名：网关必须去国内 DNS 拿真实 IP，这一次是跨境回源。
+
+回源延迟可以靠缓存消掉。`cache_min_ttl`（默认 600 秒）让网关侧缓存比下发给手机的 TTL 活得更久——上游常只给 60 秒，手机按这个 TTL 回头再问时，网关仍然命中缓存，只付「手机 → 网关」这一跳，不再跨境。对外下发的 TTL 依旧不超过上游原值，所以手机端的缓存策略和直连运营商 DNS 时一样。
+
+真正想让国内域名**完全不经过网关**，只有客户端分流一条路（AdGuard、RethinkDNS、sing-box 这类按规则选上游的 App），代价是多装一个常驻 App。不装 App 就没有这个选项，这是私人 DNS 的机制决定的，不是脚本能绕开的。
 
 ## 已知限制
 
