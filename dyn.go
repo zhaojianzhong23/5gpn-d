@@ -27,6 +27,7 @@ type Dyn struct {
 	domain  string
 	routing bool
 	sources []RemoteSource
+	proxy   *mihomoMgr
 	// 每个出口的最近一次探测结果，仅用于展示
 	probe map[string]ProbeResult
 }
@@ -43,6 +44,13 @@ func newDyn(cfg *Config, path string) *Dyn {
 	d := &Dyn{path: path, probe: map[string]ProbeResult{}}
 	d.loadFrom(cfg)
 	return d
+}
+
+// setProxy 注入代理内核管理器，用于把 mihomo 出口解析成本地 socks5 地址。
+func (d *Dyn) setProxy(m *mihomoMgr) {
+	d.mu.Lock()
+	d.proxy = m
+	d.mu.Unlock()
 }
 
 func (d *Dyn) loadFrom(cfg *Config) {
@@ -196,15 +204,22 @@ func (d *Dyn) findLocked(name string) *Exit {
 func (d *Dyn) Resolve(name string) Exit {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
+	var e *Exit
 	if name != "" {
-		if e := d.findLocked(name); e != nil {
-			return *e
-		}
+		e = d.findLocked(name)
 	}
-	if e := d.findLocked(d.defExit); e != nil {
-		return *e
+	if e == nil {
+		e = d.findLocked(d.defExit)
 	}
-	return Exit{Name: ExitDirect, Type: "direct"}
+	if e == nil {
+		return Exit{Name: ExitDirect, Type: "direct"}
+	}
+	out := *e
+	// mihomo 出口的真实地址随进程启动才确定，这里动态补上
+	if out.Type == "mihomo" {
+		out.Addr = d.proxy.Addr(out.Name)
+	}
+	return out
 }
 
 // SetDefault 切换默认出口并写回配置。
@@ -254,11 +269,32 @@ func (d *Dyn) UpsertExit(e Exit) error {
 	exits := append([]Exit{}, d.exits...)
 	d.mu.Unlock()
 
-	cfgExits := make([]map[string]any, 0, len(exits))
-	for _, x := range exits {
-		cfgExits = append(cfgExits, map[string]any{"name": x.Name, "type": x.Type, "addr": x.Addr})
+	if err := d.save(map[string]any{"exits": exitsToJSON(exits)}); err != nil {
+		return err
 	}
-	return d.save(map[string]any{"exits": cfgExits})
+	if d.proxy != nil {
+		// 改成非内核类型时，停掉之前可能跑着的进程
+		if e.Type != "mihomo" {
+			d.proxy.Stop(e.Name)
+		} else if err := d.proxy.Start(e.Name, e.Link); err != nil {
+			// 配置已经落盘，这里只报告内核没起来
+			return fmt.Errorf("配置已保存，但内核启动失败: %w", err)
+		}
+	}
+	return nil
+}
+
+// exitsToJSON 把出口表转成写回配置的形状。
+func exitsToJSON(list []Exit) []map[string]any {
+	out := make([]map[string]any, 0, len(list))
+	for _, x := range list {
+		m := map[string]any{"name": x.Name, "type": x.Type, "addr": x.Addr}
+		if x.Link != "" {
+			m["link"] = x.Link
+		}
+		out = append(out, m)
+	}
+	return out
 }
 
 // RenameExit 重命名出口，同时把规则里引用旧名的目标改掉。
@@ -288,11 +324,20 @@ func (d *Dyn) RenameExit(old, newName string) error {
 	def := d.defExit
 	d.mu.Unlock()
 
-	cfgExits := make([]map[string]any, 0, len(exits))
-	for _, x := range exits {
-		cfgExits = append(cfgExits, map[string]any{"name": x.Name, "type": x.Type, "addr": x.Addr})
+	if err := d.save(map[string]any{"exits": exitsToJSON(exits), "default_exit": def}); err != nil {
+		return err
 	}
-	return d.save(map[string]any{"exits": cfgExits, "default_exit": def})
+	if d.proxy != nil {
+		d.proxy.Stop(old)
+		for _, x := range exits {
+			if x.Name == newName && x.Type == "mihomo" {
+				if err := d.proxy.Start(newName, x.Link); err != nil {
+					return fmt.Errorf("已重命名，但内核重启失败: %w", err)
+				}
+			}
+		}
+	}
+	return nil
 }
 
 // DeleteExit 删除出口。直连出口与正在使用的默认出口不允许删。
@@ -321,11 +366,13 @@ func (d *Dyn) DeleteExit(name string) error {
 	exits := append([]Exit{}, d.exits...)
 	d.mu.Unlock()
 
-	cfgExits := make([]map[string]any, 0, len(exits))
-	for _, x := range exits {
-		cfgExits = append(cfgExits, map[string]any{"name": x.Name, "type": x.Type, "addr": x.Addr})
+	if err := d.save(map[string]any{"exits": exitsToJSON(exits)}); err != nil {
+		return err
 	}
-	return d.save(map[string]any{"exits": cfgExits})
+	if d.proxy != nil {
+		d.proxy.Stop(name)
+	}
+	return nil
 }
 
 // SetDNS 更新国际/国内 DNS 池并写回配置。
@@ -444,7 +491,10 @@ func (d *Dyn) save(patch map[string]any) error {
 
 // DialVia 通过指定出口建立 TCP 连接。e.Type=direct 表示本机直出。
 func DialVia(e Exit, host string, port int, timeout time.Duration, remoteDNS func() []string) (net.Conn, error) {
-	if e.Type == "socks5" {
+	if e.Type == "socks5" || e.Type == "mihomo" {
+		if e.Addr == "" {
+			return nil, fmt.Errorf("出口 %s 未就绪（内核可能没启动）", e.Name)
+		}
 		return dialSocks5Timeout(e.Addr, host, port, timeout)
 	}
 	if ip := net.ParseIP(host); ip != nil {

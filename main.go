@@ -56,6 +56,19 @@ func setLogLevel(s string) {
 	}
 }
 
+// exitLabels 把出口表转成 "名字(类型)" 形式，日志里能直接看出走的是什么。
+func exitLabels(list []Exit) []string {
+	out := make([]string, 0, len(list))
+	for _, e := range list {
+		t := e.Type
+		if t == "mihomo" {
+			t = linkKind(e.Link)
+		}
+		out = append(out, e.Name+"("+t+")")
+	}
+	return out
+}
+
 // ruleHolder 保存当前规则集，并记住远程部分以便只重载本地文件。
 type ruleHolder struct {
 	mu     sync.RWMutex
@@ -109,6 +122,19 @@ func main() {
 
 	dyn := newDyn(cfg, *cfgPath)
 
+	// 代理内核：type=mihomo 的出口靠它落地成本地 socks5
+	mgr := newMihomoMgr(cfg.MihomoBin, "")
+	dyn.setProxy(mgr)
+	defer mgr.StopAll()
+	for _, e := range cfg.Exits {
+		if e.Type != "mihomo" {
+			continue
+		}
+		if err := mgr.Start(e.Name, e.Link); err != nil {
+			logf("error", "出口 %s 启动失败: %v", e.Name, err)
+		}
+	}
+
 	// 启动阶段只读缓存，联网拉取交给后台刷新，避免网络慢拖住服务
 	rules, remote, err := LoadMergedRulesCached(cfg, dyn.Sources())
 	if err != nil {
@@ -138,7 +164,7 @@ func main() {
 		gwNote = "（自动探测自 client_cidr）"
 	}
 	logf("info", "dotmux %s 启动，网关 %s%s，出口 %s，规则 %d 条，客户端网段 %s",
-		version, cfg.GatewayIP, gwNote, strings.Join(dyn.ExitNames(), "/"), rules.Count(),
+		version, cfg.GatewayIP, gwNote, strings.Join(exitLabels(cfg.Exits), "/"), rules.Count(),
 		strings.Join(cfg.ClientCIDR, ","))
 
 	if _, err := startDoT(cfg, holder.get, dyn, tlsCfg); err != nil {
@@ -169,6 +195,7 @@ func main() {
 			return map[string]bool{"dot": true, "sni": health["sni"], "quic": health["quic"]}
 		},
 		QUICOn:    cfg.QUIC.Enabled,
+		Proxy:     mgr,
 		CertPath:  cfg.CertFile,
 		RulesFile: cfg.RulesFile,
 		ProfileURL: func() string {

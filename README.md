@@ -9,7 +9,7 @@ iPhone/Android ── DoT :853 ──► dotmux ──► 国内域名：返回�
                                               │
                                     手机回连 :443 / :80 / UDP:443
                                               │
-              读 SNI / Host / QUIC Initial ──► 按规则选出口（直连 / 多个 SOCKS5）
+              读 SNI / Host / QUIC Initial ──► 按规则选出口（直连 / SOCKS5 / 任意节点）
 ```
 
 单二进制、单配置文件。核心 3.5k 行 Go，测试 1.6k 行，只依赖 `miekg/dns`。
@@ -22,7 +22,7 @@ iPhone/Android ── DoT :853 ──► dotmux ──► 国内域名：返回�
 | 记录抑制 | 对托管客户端拒绝 `AAAA`、`HTTPS`、`SVCB`，防止拿到真实地址绕过网关 |
 | TCP 443/80 | 从 ClientHello 读 SNI（HTTP 读 Host），按域名选出口转发 |
 | QUIC UDP/443 | 解密 QUIC v1 Initial 包取 SNI，其余数据原样中继；会话按来源地址维护，空闲回收 |
-| 多出口 | `exits[]` 里可以放任意多个 SOCKS5，规则用 `proxy:名字` 精确指定；默认出口可在 Bot 里一键切换 |
+| 多出口 | `exits[]` 可放任意多个出口：`direct`、`socks5`，或直接粘 **ss / vmess / vless / trojan / hysteria2 / tuic / anytls** 分享链接（由内置 mihomo 落地）；规则用 `proxy:名字` 精确指定，默认出口 Bot 里一键切换 |
 | 规则 | 本地文件 + 定时拉取远程规则源（gfwlist / clash / 纯域名），失败回退上次缓存 |
 | 控制 | Telegram 面板：状态、出口增删改查与探测、规则与规则集增删、分类映射、DNS/域名/证书、日志、重启 |
 | 边界 | 只接管 `client_cidr` 内的来源，其它来源按真实地址解析，不影响别人 |
@@ -33,7 +33,8 @@ iPhone/Android ── DoT :853 ──► dotmux ──► 国内域名：返回�
 1. 有公网 IPv4 的 VPS（Debian 12+ / Ubuntu 22.04+），root；
 2. 一个域名，A 记录指向该 VPS（DoT 证书，需 TCP/80 可签 Let's Encrypt，Cloudflare 用灰云）；
 3. 一个固定来源网段 `client_cidr` —— **网关靠来源网段判断"这条查询是我的设备发的"**。手机流量若没有固定私网源段，这套方案不成立；装的时候会问，手机卡只给单个 IP（如 `172.22.1.10`）也可以直接填，程序按 `/32` 处理；
-4. 可选：一个或多个 SOCKS5 落地（没有则用网关公网出口直连）。
+4. 可选：一个或多个落地出口。可以是 SOCKS5，也可以直接粘机场的分享链接（ss / vmess / vless / trojan / hysteria2 / tuic / anytls），dotmux 会为每个出口拉起一个 mihomo 实例，本地监听 socks5 后接进来；
+5. 想用分享链接的话需要一个 `mihomo` 二进制，安装脚本会自动装，也可以 `MIHOMO_BIN` 指到已有路径。
 
 放行：TCP `853`、`80`、`443`，UDP `443`。
 
@@ -68,7 +69,8 @@ sudo DOMAIN=dot.example.com EMAIL=you@example.com CLIENT_CIDR=172.22.0.0/16 \
 | `client_cidr` | 受管来源网段，可多条；单张卡直接写 IP 也行（自动按 `/32`） |
 | `remote_dns` | 国际 DNS，用于解析代理域名的真实地址 |
 | `local_dns` | 国内 DNS，用于直连域名的真实解析（旧字段 `upstream_dns` 自动视为它） |
-| `exits[]` | 出口表：`{name, type: direct|socks5, addr}`，至少要有一个 direct |
+| `exits[]` | 出口表：`{name, type: direct|socks5|mihomo, addr?, link?}`，至少要有一个 direct |
+| `mihomo_bin` | 代理内核路径，默认 `/usr/local/bin/mihomo`；只用 direct / socks5 时可以不装 |
 | `default_exit` | 默认出口名；`direct` 规则之外的流量都走这里 |
 | `routing_enabled` | 分流开关，关掉等于全部走默认出口 |
 | `cache_size` / `synthetic_ttl` | DNS 缓存条数 / 改写记录 TTL |
@@ -80,6 +82,27 @@ sudo DOMAIN=dot.example.com EMAIL=you@example.com CLIENT_CIDR=172.22.0.0/16 \
 | `quic.enabled` / `listen` / `idle_sec` | QUIC 中继开关、监听、会话空闲秒数 |
 
 旧版只有 `socks5: "host:port"` 的配置可以继续用：启动时会自动升格成名为 `proxy` 的出口并设为默认。
+
+### 出口：直接粘分享链接
+
+Bot 里「出口管理 → 添加出口」，发一条即可（名字可省）：
+
+```
+香港 ss://YWVzLTI1Ni1nY206cGFzcw==@1.2.3.4:8388
+日本 vmess://eyJhZGQiOiJleGFtcGxlLmNvbSIsInBvcnQiOiI0NDMiLCJpZCI6Ii4uLiJ9
+美国 vless://uuid@host:443?security=reality&pbk=公钥&sni=域名&type=grpc
+```
+
+支持 `ss`（含 2022 与插件）、`vmess`、`vless`（含 reality / ws / grpc / h2）、`trojan`、`hysteria2`、
+`tuic`、`anytls`、`socks5`、`http`。
+
+每个这样的出口会拉起一个独立 mihomo 实例，监听 `127.0.0.1:20000` 起的端口，dotmux 把它当普通 socks5 用：
+
+- 一个出口崩了不影响其它出口，`journalctl -u dotmux` 里能看到是哪个没起来；
+- 添加时会等内核端口真正就绪才返回成功，配置错会当场告诉你（并附 mihomo 日志尾部）；
+- 删除或重命名出口时，对应进程一起停掉 / 重启，不会留孤儿。
+
+只写 `socks5://` 或裸 `host:port` 的出口不经过内核，dotmux 自己拨号，省一个进程。
 
 ## 规则
 
@@ -139,7 +162,7 @@ FINAL,direct
 | 页面 | 内容 |
 |---|---|
 | 📊 状态 | DoT / SNI / QUIC 健康、iOS 描述文件、Bot 自身；当前出口、域名、分流开关、规则数、FINAL；运行时长、CPU 与 load、内存 / Swap、证书剩余天数 |
-| 🌐 出口管理 | 当前出口与出口 IP；点名字切换默认出口；添加（`名字 socks5://user:pass@host:port`）、重命名（规则里的引用一起改）、删除、并发探测所有出口 |
+| 🌐 出口管理 | 当前出口与出口 IP；点名字切换默认出口；添加（`名字 socks5://…` 或直接粘 `名字 ss://…` / `vmess://…` 等分享链接）、重命名（规则里的引用一起改）、删除、并发探测所有出口 |
 | 📋 分流管理 | 规则列表、规则集列表、规则设置；添加 / 删除本地规则；添加 / 删除远程规则集；分类→出口映射；立即更新规则；一键开关分流 |
 | 🛠 系统管理 | 改域名（证书路径同步改）、改国际 / 国内 DNS、续期证书（certbot，异步回执）、重启服务、看最近日志 |
 | 📱 iOS 二维码 | 把 `profile_url` 生成二维码，手机扫码即装 |
@@ -182,7 +205,7 @@ bash scripts/make-profile.sh dot.example.com 203.0.113.10 > dotmux.mobileconfig
 - **无 Web 面板**，只有 Bot 和命令行。
 - **IPv4 only**，AAAA 一律拒绝。
 - **不做 MITM**，不解密任何应用层流量（QUIC 只解密 Initial 握手包，这是协议规定允许的）。
-- 出口类型只有 `direct` 和 `socks5`，没有 http / wireguard / anytls。
+- 出口类型是 `direct`、`socks5` 和 `mihomo`（跑分享链接的内核）。**wireguard 没做**——要的话得再加 `wg-quick` 那种独立网卡模式，和现在的 socks 转发模型不一样。
 
 ## 开发
 

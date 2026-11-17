@@ -26,6 +26,8 @@ type tgDeps struct {
 	QUICOn      bool
 	CertPath    string
 	ProfileURL  func() string
+	// Proxy 是代理内核管理器，用于显示 mihomo 出口是否在运行
+	Proxy *mihomoMgr
 }
 
 // tgsess 记录「等待用户输入」的多步操作。
@@ -380,10 +382,18 @@ func (b *tgBot) saveOffset() {
 }
 
 func exitLabel(e Exit) string {
-	if e.Type == "direct" {
+	switch e.Type {
+	case "direct":
 		return e.Name + "（本机直出）"
+	case "mihomo":
+		kind := linkKind(e.Link)
+		if e.Addr == "" {
+			return e.Name + "（" + kind + " · 未就绪）"
+		}
+		return e.Name + "（" + kind + " 节点）"
+	default:
+		return e.Name + "（SOCKS5 " + maskAddr(e.Addr) + "）"
 	}
-	return e.Name + "（SOCKS5 " + maskAddr(e.Addr) + "）"
 }
 
 func maskAddr(s string) string {

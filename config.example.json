@@ -1,22 +1,53 @@
 {
-  "listen": { "dot": ":853", "tls": ":443", "http": ":80" },
+  "listen": {
+    "dot": ":853",
+    "tls": ":443",
+    "http": ":80"
+  },
   "domain": "dot.example.com",
   "cert_file": "/etc/letsencrypt/live/dot.example.com/fullchain.pem",
   "key_file": "/etc/letsencrypt/live/dot.example.com/privkey.pem",
   "gateway_ip": "203.0.113.10",
-  "client_cidr": ["172.22.0.0/16"],
-  "remote_dns": ["1.1.1.1", "8.8.8.8", "9.9.9.9"],
-  "local_dns": ["101.226.4.6", "218.30.118.6", "180.76.76.76", "119.29.29.29"],
-  "exits": [
-    { "name": "local", "type": "direct", "addr": "" },
-    { "name": "香港", "type": "socks5", "addr": "user:pass@1.2.3.4:1080" }
+  "client_cidr": [
+    "172.22.0.0/16"
   ],
-  "default_exit": "香港",
+  "remote_dns": [
+    "1.1.1.1",
+    "8.8.8.8",
+    "9.9.9.9"
+  ],
+  "local_dns": [
+    "101.226.4.6",
+    "218.30.118.6",
+    "180.76.76.76",
+    "119.29.29.29"
+  ],
+  "mihomo_bin": "/usr/local/bin/mihomo",
+  "exits": [
+    {
+      "name": "local",
+      "type": "direct",
+      "addr": ""
+    },
+    {
+      "name": "socks",
+      "type": "socks5",
+      "addr": "user:pass@1.2.3.4:1080"
+    },
+    {
+      "name": "香港",
+      "type": "mihomo",
+      "link": "ss://YWVzLTI1Ni1nY206eW91ci1wYXNzd29yZA==@5.6.7.8:8388#hk"
+    }
+  ],
+  "default_exit": "local",
   "routing_enabled": true,
   "rules_file": "/etc/dotmux/rules.conf",
   "cache_size": 8192,
   "synthetic_ttl": 60,
-  "log": { "level": "info" },
+  "log": {
+    "level": "info"
+  },
   "rules": {
     "refresh_hours": 24,
     "cache_dir": "/var/lib/dotmux/rules",
@@ -36,5 +67,9 @@
     "state_file": "/var/lib/dotmux/tg-state.json",
     "profile_url": ""
   },
-  "quic": { "enabled": true, "listen": ":443", "idle_sec": 30 }
+  "quic": {
+    "enabled": true,
+    "listen": ":443",
+    "idle_sec": 30
+  }
 }

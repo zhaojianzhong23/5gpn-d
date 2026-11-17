@@ -107,10 +107,50 @@ else
 fi
 [[ -n "$GATEWAY_IP" ]] || { err "需要公网 IPv4"; exit 1; }
 
+MIHOMO_VERSION="${MIHOMO_VERSION:-1.19.28}"
+
+# 代理内核：出口粘 ss/vmess/vless/trojan/hysteria2 等链接时用它落地
+install_mihomo() {
+    if command -v mihomo >/dev/null 2>&1; then
+        ok "mihomo 已存在：$(command -v mihomo)"
+        return 0
+    fi
+    local arch
+    case "$(uname -m)" in
+        x86_64|amd64)  arch=amd64 ;;
+        aarch64|arm64) arch=arm64 ;;
+        *) warn "未知架构 $(uname -m)，跳过 mihomo（出口只能用 direct / socks5）"; return 0 ;;
+    esac
+    local name="mihomo-linux-${arch}-v${MIHOMO_VERSION}"
+    local base="https://github.com/MetaCubeX/mihomo/releases/download/v${MIHOMO_VERSION}"
+    local tmp; tmp="$(mktemp -d)"
+    local okdl=0
+    # 先直连，失败再走镜像
+    for prefix in "" "https://ghfast.top/"; do
+        if curl -fL --max-time 180 -o "${tmp}/m.gz" "${prefix}${base}/${name}.gz" 2>/dev/null; then
+            okdl=1; break
+        fi
+    done
+    if [[ "$okdl" != "1" ]]; then
+        rm -rf "$tmp"
+        warn "mihomo 下载失败，跳过（出口暂时只能用 direct / socks5，稍后可手动安装）"
+        return 0
+    fi
+    gunzip -f "${tmp}/m.gz" || { rm -rf "$tmp"; warn "解压 mihomo 失败"; return 0; }
+    install -m 0755 "${tmp}/m" /usr/local/bin/mihomo || { rm -rf "$tmp"; warn "安装 mihomo 失败"; return 0; }
+    rm -rf "$tmp"
+    if /usr/local/bin/mihomo -v >/dev/null 2>&1; then
+        ok "mihomo v${MIHOMO_VERSION} 已安装"
+    else
+        warn "mihomo 安装后无法执行，出口请先用 direct / socks5"
+    fi
+}
+
 info "安装依赖..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y -qq ca-certificates curl certbot >/dev/null
+apt-get install -y -qq ca-certificates curl certbot gzip >/dev/null
+install_mihomo
 
 # ---------- 证书 ----------
 if [[ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]]; then
@@ -163,6 +203,7 @@ else
   "client_cidr": ["$CLIENT_CIDR"],
   "remote_dns": ["1.1.1.1", "8.8.8.8", "9.9.9.9"],
   "local_dns": ["101.226.4.6", "218.30.118.6", "180.76.76.76", "119.29.29.29"],
+  "mihomo_bin": "/usr/local/bin/mihomo",
   "exits": $EXITS_JSON,
   "default_exit": "$DEF_EXIT",
   "routing_enabled": true,

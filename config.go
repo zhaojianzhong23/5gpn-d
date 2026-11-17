@@ -17,12 +17,14 @@ type Config struct {
 	KeyFile   string `json:"key_file"`
 	GatewayIP string `json:"gateway_ip"`
 	// gatewayAuto 记录网关地址是自动探测来的，仅用于启动日志，不参与序列化。
-	gatewayAuto  bool      `json:"-"`
-	ClientCIDR   []string  `json:"client_cidr"`
-	UpstreamDNS  []string  `json:"upstream_dns"`
-	RemoteDNS    []string  `json:"remote_dns"`
-	LocalDNS     []string  `json:"local_dns"`
-	Socks5       string    `json:"socks5"`
+	gatewayAuto bool     `json:"-"`
+	ClientCIDR  []string `json:"client_cidr"`
+	UpstreamDNS []string `json:"upstream_dns"`
+	RemoteDNS   []string `json:"remote_dns"`
+	LocalDNS    []string `json:"local_dns"`
+	Socks5      string   `json:"socks5"`
+	// MihomoBin 是代理内核路径，type=mihomo 的出口靠它落地成 socks5。
+	MihomoBin    string    `json:"mihomo_bin"`
 	Exits        []Exit    `json:"exits"`
 	DefaultExit  string    `json:"default_exit"`
 	Routing      bool      `json:"routing_enabled"`
@@ -48,8 +50,11 @@ type LogConfig struct {
 // Exit 是一个流量出口。type=direct 表示本机直连（忽略 addr）。
 type Exit struct {
 	Name string `json:"name"`
-	Type string `json:"type"` // direct | socks5
-	Addr string `json:"addr"` // socks5: [user:pass@]host:port
+	Type string `json:"type"`           // direct | socks5 | mihomo
+	Addr string `json:"addr,omitempty"` // socks5: [user:pass@]host:port
+	// Link 是代理分享链接（ss:// vmess:// vless:// trojan:// hysteria2:// …），
+	// type=mihomo 时由内置 mihomo 子进程解析并落地成 socks5。
+	Link string `json:"link,omitempty"`
 }
 
 // RulesConf 描述远程规则源。
@@ -92,6 +97,7 @@ func defaultConfig() *Config {
 	c.CertFile = "/etc/letsencrypt/live/gateway.example.com/fullchain.pem"
 	c.KeyFile = "/etc/letsencrypt/live/gateway.example.com/privkey.pem"
 	c.ClientCIDR = []string{"172.22.0.0/16"}
+	c.MihomoBin = "/usr/local/bin/mihomo"
 	c.UpstreamDNS = []string{"223.5.5.5:53", "119.29.29.29:53"}
 	c.LocalDNS = []string{"101.226.4.6", "218.30.118.6", "180.76.76.76", "119.29.29.29"}
 	c.RemoteDNS = []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"}
@@ -221,6 +227,9 @@ func (c *Config) validate() error {
 	if c.Telegram.StateFile == "" {
 		c.Telegram.StateFile = "/var/lib/dotmux/tg-state.json"
 	}
+	if c.MihomoBin == "" {
+		c.MihomoBin = "/usr/local/bin/mihomo"
+	}
 	if c.QUIC.Listen == "" {
 		c.QUIC.Listen = ":443"
 	}
@@ -271,19 +280,39 @@ func (c *Config) validateExits() error {
 			return fmt.Errorf("出口名重复: %s", e.Name)
 		}
 		seen[e.Name] = true
+		// 只给了链接没写类型时按 mihomo 处理，手写配置时省一步
 		if e.Type == "" {
-			e.Type = "direct"
+			if e.Link != "" {
+				e.Type = "mihomo"
+			} else {
+				e.Type = "direct"
+			}
 		}
 		switch e.Type {
 		case "direct":
 			hasDirect = true
 			e.Addr = ""
+			e.Link = ""
 		case "socks5":
 			if e.Addr == "" {
 				return fmt.Errorf("出口 %s 缺少 addr", e.Name)
 			}
+			e.Link = ""
+		case "mihomo", "proxy", "uri":
+			e.Type = "mihomo"
+			e.Link = strings.TrimSpace(e.Link)
+			if e.Link == "" && e.Addr == "" {
+				return fmt.Errorf("出口 %s 缺少 link", e.Name)
+			}
+			// 允许直接写 socks5 地址，交给 mihomo 托管（UDP 场景有用）
+			if e.Link == "" {
+				e.Link = "socks5://" + e.Addr
+			}
+			if _, err := ParseProxyURI(e.Link); err != nil {
+				return fmt.Errorf("出口 %s 的链接无法识别: %w", e.Name, err)
+			}
 		default:
-			return fmt.Errorf("出口 %s 类型不支持: %s（仅 direct / socks5）", e.Name, e.Type)
+			return fmt.Errorf("出口 %s 类型不支持: %s（direct / socks5 / mihomo）", e.Name, e.Type)
 		}
 	}
 	if !hasDirect {

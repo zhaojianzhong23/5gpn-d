@@ -205,9 +205,16 @@ func (b *tgBot) renderExits() (string, *tgKeyboard) {
 	rows := make([][]tgButton, 0, len(exits)+4)
 	for _, e := range exits {
 		label := e.Name
-		if e.Type == "socks5" {
+		switch e.Type {
+		case "socks5":
 			label += "（" + maskAddr(e.Addr) + "）"
-		} else {
+		case "mihomo":
+			state := ""
+			if b.deps.Proxy != nil && !b.deps.Proxy.Running()[e.Name] {
+				state = " · 未运行"
+			}
+			label += "（" + linkKind(e.Link) + state + "）"
+		default:
 			label += "（直出）"
 		}
 		if e.Name == cur {
@@ -480,10 +487,12 @@ func (b *tgBot) onCallback(chatID, msgID int64, data string) {
 	case data == "x:add":
 		b.askInput(chatID, msgID, "add_exit", "",
 			"➕ 添加出口\n\n"+
-				"发一条消息，格式任选：\n"+
+				"发一条消息，直接粘链接即可：\n"+
+				"<名字> ss://… / vmess://… / vless://…\n"+
+				"      trojan://… / hysteria2://… / tuic://…\n"+
 				"<名字> socks5://user:pass@host:port\n"+
 				"<名字> direct\n\n"+
-				"例：香港 socks5://u:p@1.2.3.4:1080\n"+
+				"例：香港 vmess://eyJhZGQiOi…\n"+
 				"不写名字会自动命名。\n\n发 /cancel 取消。")
 	case data == "x:ren":
 		b.goPage(chatID, msgID, pageExitsRename, "")
@@ -850,28 +859,20 @@ func (b *tgBot) onInput(chatID int64, s *tgsess, text string) {
 	}
 }
 
-// parseExitInput 解析 "名字 socks5://user:pass@host:port" 或 "名字 direct"。
+// parseExitInput 解析 "<名字> <链接>"。链接可以是 socks5 地址、direct，
+// 也可以是任意分享链接（ss/vmess/vless/trojan/hysteria2/tuic/anytls），
+// 后者交给内置 mihomo 落地。
 func parseExitInput(s string, seq int) (Exit, error) {
-	fields := strings.Fields(s)
-	if len(fields) == 0 {
+	s = strings.TrimSpace(s)
+	if s == "" {
 		return Exit{}, fmt.Errorf("没有内容")
 	}
-	name := ""
-	addr := ""
-	if len(fields) >= 2 {
-		name, addr = fields[0], fields[1]
+	var name, rest string
+	if i := strings.IndexAny(s, " \t"); i > 0 {
+		name, rest = s[:i], strings.TrimSpace(s[i+1:])
 	} else {
-		addr = fields[0]
+		rest = s
 	}
-	addr = strings.TrimSpace(addr)
-	if strings.EqualFold(addr, "direct") || addr == "local" {
-		if name == "" {
-			name = "local" + strconv.Itoa(seq)
-		}
-		return Exit{Name: name, Type: "direct"}, nil
-	}
-	addr = strings.TrimPrefix(addr, "socks5://")
-	addr = strings.TrimPrefix(addr, "socks://")
 	if name == "" {
 		name = "exit" + strconv.Itoa(seq)
 	}
@@ -881,18 +882,46 @@ func parseExitInput(s string, seq int) (Exit, error) {
 	if strings.ContainsAny(name, " ,\t:") {
 		return Exit{}, fmt.Errorf("出口名不能包含空格、逗号或冒号")
 	}
+
+	if strings.EqualFold(rest, "direct") || strings.EqualFold(rest, "local") {
+		return Exit{Name: name, Type: "direct"}, nil
+	}
+
+	low := strings.ToLower(rest)
+	// ss / vmess / vless / trojan / hysteria2 / tuic / anytls：交给内核
+	if isProxyLink(low) {
+		if _, err := ParseProxyURI(rest); err != nil {
+			return Exit{}, err
+		}
+		return Exit{Name: name, Type: "mihomo", Link: rest}, nil
+	}
+
+	// 其余按 socks5 地址处理，dotmux 自己拨号，不需要内核
+	addr := strings.TrimPrefix(rest, "socks5://")
+	addr = strings.TrimPrefix(addr, "socks://")
 	host := addr
 	if i := strings.LastIndex(addr, "@"); i >= 0 {
 		host = addr[i+1:]
 	}
 	h, p, err := net.SplitHostPort(host)
 	if err != nil || h == "" || p == "" {
-		return Exit{}, fmt.Errorf("SOCKS5 地址要写成 host:port，例如 1.2.3.4:1080")
+		return Exit{}, fmt.Errorf("SOCKS5 地址要写成 host:port，或直接粘代理分享链接")
 	}
-	if _, err := strconv.Atoi(p); err != nil {
-		return Exit{}, fmt.Errorf("端口不是数字: %s", p)
+	if n, cerr := strconv.Atoi(p); cerr != nil || n <= 0 || n > 65535 {
+		return Exit{}, fmt.Errorf("端口不合法: %s", p)
 	}
 	return Exit{Name: name, Type: "socks5", Addr: addr}, nil
+}
+
+// isProxyLink 判断是否是交给 mihomo 的分享链接（不含 socks5，那个自己拨更快）。
+func isProxyLink(low string) bool {
+	for _, p := range []string{"ss://", "vmess://", "vless://", "trojan://",
+		"hysteria2://", "hy2://", "tuic://", "anytls://", "http://", "https://"} {
+		if strings.HasPrefix(low, p) {
+			return true
+		}
+	}
+	return false
 }
 
 func parseDNSList(s string) ([]string, error) {
