@@ -93,6 +93,26 @@ detect_local_ip() {
         | grep -v '^127\.' | grep -F "$pfx" | head -1 || true
 }
 
+# 判断 IP 是否落在网段内。只按整字节比较，够覆盖 /8 /16 /24 /32 这几种常见掩码。
+in_cidr() {
+    local ip="$1" cidr="$2" addr bits
+    addr="${cidr%%/*}"
+    bits="${cidr##*/}"
+    [[ "$addr" == "$cidr" ]] && bits=32
+    if [[ "$bits" == "32" ]]; then
+        [[ "$ip" == "$addr" ]]; return
+    fi
+    local n=$((bits / 8)) i
+    [[ "$n" -eq 0 ]] && return 0
+    local -a a b
+    IFS=. read -r -a a <<< "$ip"
+    IFS=. read -r -a b <<< "$addr"
+    for ((i = 0; i < n; i++)); do
+        [[ "${a[i]:-}" == "${b[i]:-}" ]] || return 1
+    done
+    return 0
+}
+
 if [[ -z "$GATEWAY_IP" ]]; then
     GATEWAY_IP="$(detect_local_ip "$CLIENT_CIDR")"
     if [[ -n "$GATEWAY_IP" ]]; then
@@ -244,6 +264,7 @@ else
   "key_file": "/etc/letsencrypt/live/$DOMAIN/privkey.pem",
   "gateway_ip": "$GATEWAY_IP",
   "client_cidr": ["$CLIENT_CIDR"],
+  "ecs": "${ECS:-139.226.48.1}",
   "remote_dns": ["1.1.1.1", "8.8.8.8", "9.9.9.9"],
   "local_dns": ["101.226.4.6", "218.30.118.6", "180.76.76.76", "119.29.29.29"],
   "mihomo_bin": "/usr/local/bin/mihomo",
@@ -362,3 +383,24 @@ cat <<EOF
   iPhone : 需要描述文件指向 $DOMAIN，见 README 的「客户端接入」
   Android: 设置 → 私人 DNS → 填 $DOMAIN
 EOF
+
+# 专线场景最要命的一条：proxy 域名的 A 记录返回的就是这个网关地址，
+# 手机必须能直接连到它。如果它不是客户端网段内的地址，
+# 手机要么去绕公网、要么根本连不上，整套分流等于没装。
+if ! in_cidr "$GATEWAY_IP" "$CLIENT_CIDR"; then
+    printf '\n'
+    err "网关地址 $GATEWAY_IP 不在客户端网段 $CLIENT_CIDR 内"
+    cat <<EOF
+
+  分流域名的 A 记录会返回这个地址，手机得能直连它。
+  手机卡走专线访问 VPS 内网地址的场景下，这里必须是同段地址
+  （VPS 上与手机卡同网段的那块网卡的 IP），否则分流不生效。
+
+  确认 VPS 上的专线网卡地址：
+    ip -4 addr show
+
+  重新指定：
+    sudo GATEWAY_IP=172.22.x.y bash install.sh
+  或直接改 $CONF 里的 "gateway_ip"，然后 systemctl restart dotmux
+EOF
+fi

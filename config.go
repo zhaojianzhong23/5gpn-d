@@ -19,6 +19,9 @@ type Config struct {
 	// gatewayAuto 记录网关地址是自动探测来的，仅用于启动日志，不参与序列化。
 	gatewayAuto bool     `json:"-"`
 	ClientCIDR  []string `json:"client_cidr"`
+	// ECS 是国内直连查询要带的 EDNS Client Subnet。
+	// 网关在境外，国内 DNS 只看得到 VPS 的地址，不带 ECS 会把 CDN 调度到海外节点。
+	ECS         string   `json:"ecs"`
 	UpstreamDNS []string `json:"upstream_dns"`
 	RemoteDNS   []string `json:"remote_dns"`
 	LocalDNS    []string `json:"local_dns"`
@@ -115,6 +118,7 @@ func defaultConfig() *Config {
 	c.CertFile = "/etc/letsencrypt/live/gateway.example.com/fullchain.pem"
 	c.KeyFile = "/etc/letsencrypt/live/gateway.example.com/privkey.pem"
 	c.ClientCIDR = []string{"172.22.0.0/16"}
+	c.ECS = "139.226.48.1"
 	c.MihomoBin = "/usr/local/bin/mihomo"
 	c.UpstreamDNS = []string{"223.5.5.5:53", "119.29.29.29:53"}
 	c.LocalDNS = []string{"101.226.4.6", "218.30.118.6", "180.76.76.76", "119.29.29.29"}
@@ -213,6 +217,11 @@ func (c *Config) validate() error {
 	}
 	if net.ParseIP(c.GatewayIP) == nil {
 		return fmt.Errorf("gateway_ip 不是合法 IP: %s", c.GatewayIP)
+	}
+	if c.ECS != "" {
+		if ip := net.ParseIP(c.ECS); ip == nil || ip.To4() == nil {
+			return fmt.Errorf("ecs 必须是 IPv4 地址（留空表示不带 EDNS Client Subnet）: %s", c.ECS)
+		}
 	}
 	if c.Listen.DoT == "" {
 		return errors.New("listen.dot 不能为空")

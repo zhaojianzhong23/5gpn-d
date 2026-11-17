@@ -81,6 +81,7 @@ sudo DOMAIN=dot.example.com EMAIL=you@example.com CLIENT_CIDR=172.22.0.0/16 \
 | `cert_file` / `key_file` | 证书路径，每次握手读取，支持热续期 |
 | `gateway_ip` | 代理域名返回给手机的地址；**留空自动取**本机落在 `client_cidr` 内的地址，没有才报错 |
 | `client_cidr` | 受管来源网段，可多条；单张卡直接写 IP 也行（自动按 `/32`） |
+| `ecs` | 国内直连查询携带的 EDNS Client Subnet（IPv4，默认 `139.226.48.1`）。网关在境外，不带它国内 CDN 会按海外位置调度，手机上直连就绕远了；留空关闭 |
 | `remote_dns` | 国际 DNS，用于解析代理域名的真实地址 |
 | `local_dns` | 国内 DNS，用于直连域名的真实解析（旧字段 `upstream_dns` 自动视为它） |
 | `exits[]` | 出口表：`{name, type: direct|socks5|mihomo, addr?, link?}`，至少要有一个 direct |

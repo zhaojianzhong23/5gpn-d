@@ -70,6 +70,7 @@ type dnsSvc struct {
 	cache *dnsCache
 	// 启动时确定，避免每包解析
 	gatewayV4 net.IP
+	ecs       net.IP
 }
 
 func newDNSSvc(cfg *Config, rules func() *RuleSet, dyn *Dyn) *dnsSvc {
@@ -80,6 +81,7 @@ func newDNSSvc(cfg *Config, rules func() *RuleSet, dyn *Dyn) *dnsSvc {
 		nets:      cfg.ClientNets(),
 		cache:     newDNSCache(cfg.CacheSize),
 		gatewayV4: net.ParseIP(cfg.GatewayIP).To4(),
+		ecs:       net.ParseIP(cfg.ECS).To4(),
 	}
 }
 
@@ -98,7 +100,7 @@ func (s *dnsSvc) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 
 	// 非托管来源一律按真实地址解析，保证不影响其它使用者。
 	if !private {
-		s.forward(w, req)
+		s.forward(w, req, false)
 		return
 	}
 
@@ -109,7 +111,7 @@ func (s *dnsSvc) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	case dns.TypeA:
 	default:
-		s.forward(w, req)
+		s.forward(w, req, s.ecs != nil)
 		return
 	}
 
@@ -126,7 +128,7 @@ func (s *dnsSvc) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		s.replyA(w, req, q, s.gatewayV4, s.cfg.SyntheticTTL)
 		return
 	default:
-		s.forward(w, req)
+		s.forward(w, req, s.ecs != nil)
 	}
 }
 
@@ -162,7 +164,7 @@ func attachEDNS(resp, req *dns.Msg) {
 	}
 }
 
-func (s *dnsSvc) forward(w dns.ResponseWriter, req *dns.Msg) {
+func (s *dnsSvc) forward(w dns.ResponseWriter, req *dns.Msg, useECS bool) {
 	key := cacheKey(req)
 	if r := s.cache.get(key); r != nil {
 		r.Id = req.Id
@@ -170,7 +172,7 @@ func (s *dnsSvc) forward(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	}
 
-	resp, err := s.exchange(req)
+	resp, err := s.exchange(req, useECS)
 	if err != nil {
 		logf("warn", "上游解析失败 q=%s: %v", req.Question[0].Name, err)
 		s.replyEmpty(w, req, dns.RcodeServerFailure)
@@ -181,29 +183,64 @@ func (s *dnsSvc) forward(w dns.ResponseWriter, req *dns.Msg) {
 	_ = w.WriteMsg(resp)
 }
 
-func (s *dnsSvc) exchange(req *dns.Msg) (*dns.Msg, error) {
+func (s *dnsSvc) exchange(req *dns.Msg, useECS bool) (*dns.Msg, error) {
 	_, local := s.dyn.DNS()
 	if len(local) == 0 {
 		local = s.cfg.LocalDNS
+	}
+	q := req
+	if useECS && s.ecs != nil {
+		q = withECS(req, s.ecs)
 	}
 	var lastErr error
 	for _, up := range local {
 		up = dnsAddr(up)
 		c := &dns.Client{Timeout: 3 * time.Second}
-		if resp, _, err := c.Exchange(req, up); err == nil {
+		if resp, _, err := c.Exchange(q, up); err == nil {
 			return resp, nil
 		} else {
 			lastErr = err
 		}
 		// UDP 失败后用 TCP 再试一次（大响应 / 被截断）
 		ct := &dns.Client{Net: "tcp", Timeout: 3 * time.Second}
-		if resp, _, err := ct.Exchange(req, up); err == nil {
+		if resp, _, err := ct.Exchange(q, up); err == nil {
 			return resp, nil
 		} else {
 			lastErr = err
 		}
 	}
 	return nil, lastErr
+}
+
+// withECS 给查询附加 EDNS Client Subnet。
+//
+// 网关在境外，国内递归 DNS 看到的是 VPS 的地址，会按海外位置调度 CDN；
+// 手机上却要从国内直连，结果就是绕远甚至打不开。带上国内网段后，
+// 递归 DNS 会按中国用户返回节点。
+func withECS(req *dns.Msg, ip net.IP) *dns.Msg {
+	m := req.Copy()
+	opt := m.IsEdns0()
+	if opt == nil {
+		m.SetEdns0(1232, false)
+		opt = m.IsEdns0()
+		if opt == nil {
+			return m
+		}
+	}
+	// 去掉已有的 SUBNET，避免叠加成两条
+	kept := opt.Option[:0]
+	for _, o := range opt.Option {
+		if o.Option() != dns.EDNS0SUBNET {
+			kept = append(kept, o)
+		}
+	}
+	opt.Option = append(kept, &dns.EDNS0_SUBNET{
+		Code:          dns.EDNS0SUBNET,
+		Family:        1,
+		SourceNetmask: 24,
+		Address:       ip.To4(),
+	})
+	return m
 }
 
 func cacheKey(m *dns.Msg) string {

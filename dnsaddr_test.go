@@ -3,7 +3,8 @@ package main
 import "testing"
 
 // 配置里 DNS 普遍写裸 IP，而 miekg/dns 要求 host:port。
-// 这里锁住补全规则，防止再出现"上游全部 missing port in address"。
+// validate() 里的 normalizeDNS 已经补过 IPv4，但它的判断是"含冒号即视为带端口"，
+// 所以 IPv6 字面量 2606:4700::1111 会被漏掉。这里锁住统一规则。
 func TestDNSAddr(t *testing.T) {
 	cases := []struct{ in, want string }{
 		{"1.1.1.1", "1.1.1.1:53"},
