@@ -41,8 +41,11 @@ iPhone/Android ── DoT :853 ──► dotmux ──► 国内域名：返回�
 ## 安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zhaojianzhong23/dotmux/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/zhaojianzhong23/dotmux/main/install.sh -o install.sh
+sudo bash install.sh
 ```
+
+分两步是为了让交互提问能正常读到键盘。`curl … | sudo bash` 也能跑（脚本从 `/dev/tty` 读输入），但管道写法下 bash 自己占着 stdin，容易踩坑，不推荐。
 
 或先看代码：
 
@@ -54,7 +57,9 @@ sudo DOMAIN=dot.example.com EMAIL=you@example.com CLIENT_CIDR=172.22.0.0/16 \
      TG_TOKEN=123456:ABC TG_ADMINS=123456789 bash install.sh
 ```
 
-安装器：签证书 → 装二进制 → 写配置和规则 → 装 systemd 并启动。已有配置文件不会覆盖。
+安装器：签证书 → 装二进制 → 写配置和规则 → 装 systemd 并启动。已存在的配置、规则、证书一律保留，可重复执行。
+
+任何一步失败都会报出**卡在哪一阶段**，并提示主机可能处于半装状态；不会静默退出。
 
 ## 配置
 

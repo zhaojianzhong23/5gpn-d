@@ -9,13 +9,46 @@ CONF="$CONF_DIR/config.json"
 RULES="$CONF_DIR/rules.conf"
 SERVICE=/etc/systemd/system/dotmux.service
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; BLUE='\033[0;34m'; NC='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; BLUE='\033[0;34m'; YELLOW='\033[0;33m'; NC='\033[0m'
 info() { printf "${BLUE}[INFO]${NC} %s\n" "$*"; }
 ok()   { printf "${GREEN}[ OK ]${NC} %s\n" "$*"; }
+warn() { printf "${YELLOW}[WARN]${NC} %s\n" "$*"; }
 err()  { printf "${RED}[ERR ]${NC} %s\n" "$*" >&2; }
+
+# curl … | bash 时 stdin 被脚本正文自身占着，read 会读到脚本内容而不是键盘输入，
+# 于是域名会变成一个莫名其妙的片段。所有交互统一从 /dev/tty 读。
+# 拿不到终端（CI / 无 tty）就返回空，交给后面的参数校验给出明确报错。
+ask() {
+    local prompt="$1" var="$2" ans=""
+    # 先空探一次：没有控制终端时 </dev/tty 会打一行 "No such device or address"，
+    # 而这行噪音会混在安装输出里，看着像出错。
+    if { : </dev/tty; } 2>/dev/null; then
+        read -r -p "$prompt" ans </dev/tty || true
+    fi
+    printf -v "$var" '%s' "$ans"
+}
 
 [[ $EUID -eq 0 ]] || { err "请用 root 运行"; exit 1; }
 command -v systemctl >/dev/null || { err "需要 systemd"; exit 1; }
+
+# 任何一步失败都别悄悄退出：说清在哪一阶段断的、主机上留下了什么。
+STEP="检查环境"
+on_exit() {
+    local code=$?
+    if [[ $code -eq 0 ]]; then return 0; fi
+    printf '\n' >&2
+    err "安装中断：在「$STEP」阶段失败（退出码 $code）"
+    cat >&2 <<EOF
+
+主机可能停在「装了一半」的状态，先看一眼再重跑：
+  systemctl status dotmux --no-pager
+  journalctl -u dotmux -n 50 --no-pager
+  ls -l $BIN $CONF $SERVICE
+
+脚本可重入：已有的证书、配置、规则都会原样保留，重跑只补缺失的部分。
+EOF
+}
+trap on_exit EXIT
 
 DOMAIN="${DOMAIN:-}"
 EMAIL="${EMAIL:-}"
@@ -27,14 +60,14 @@ TG_ADMINS="${TG_ADMINS:-}"
 QUIC_ENABLED="${QUIC_ENABLED:-1}"
 
 if [[ -z "$DOMAIN" ]]; then
-    read -r -p "DoT 域名（A 记录已指向本机）: " DOMAIN
+    ask "DoT 域名（A 记录已指向本机）: " DOMAIN
 fi
-[[ -n "$DOMAIN" ]] || { err "域名不能为空"; exit 1; }
+[[ -n "$DOMAIN" ]] || { err "缺少域名，已中止。用 DOMAIN=dot.example.com bash install.sh 传入，或交互运行"; exit 1; }
 
 # 这个字段决定“哪些来源算我的设备”，填错整套分流都不生效，先问清楚。
 # 手机卡给的是单个 IP 也能直接填，程序会按 /32 处理。
-if [[ -t 0 && -z "$CLIENT_CIDR" ]]; then
-    read -r -p "手机卡内网 IP 或网段（如 172.22.1.10，回车用 172.22.0.0/16）: " CLIENT_CIDR
+if [[ -z "$CLIENT_CIDR" ]]; then
+    ask "手机卡内网 IP 或网段（如 172.22.1.10，回车用 172.22.0.0/16）: " CLIENT_CIDR
 fi
 CLIENT_CIDR="${CLIENT_CIDR:-172.22.0.0/16}"
 
@@ -45,10 +78,14 @@ detect_local_ip() {
     addr="${cidr%%/*}"
     bits="${cidr##*/}"
     if [[ "$addr" == "$cidr" ]]; then bits=32; fi
+    # 按掩码取前几段。不能用 ${addr%%.*.*} 这类模式——bash 的 %% 是最长匹配，
+    # /16 会退化成只留第一段，于是 172.22.0.0/16 会错配到 172.24.x.x。
+    local -a oct
+    IFS=. read -r -a oct <<< "$addr"
     case "$bits" in
-        8)  pfx="${addr%%.*}" ;;
-        16) pfx="${addr%%.*.*}" ;;
-        24) pfx="${addr%.*.*.*}" ;;
+        8)  pfx="${oct[0]}" ;;
+        16) pfx="${oct[0]}.${oct[1]}" ;;
+        24) pfx="${oct[0]}.${oct[1]}.${oct[2]}" ;;
         32) ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 \
                 | grep -Fx "$addr" | head -1 || true
             return 0 ;;
@@ -72,23 +109,19 @@ if [[ -z "$GATEWAY_IP" ]]; then
     fi
 fi
 if [[ -z "$GATEWAY_IP" ]]; then
-    read -r -p "手机能访问到的网关 IPv4: " GATEWAY_IP
+    ask "手机能访问到的网关 IPv4: " GATEWAY_IP
 fi
-if [[ -t 0 ]]; then
-    read -r -p "  网关地址（手机会连这个）[$GATEWAY_IP]: " _gw
-    if [[ -n "$_gw" ]]; then GATEWAY_IP="$_gw"; fi
-fi
+ask "  网关地址（手机会连这个）[$GATEWAY_IP]: " _gw
+if [[ -n "$_gw" ]]; then GATEWAY_IP="$_gw"; fi
 
-if [[ -t 0 && -z "$TG_TOKEN" ]]; then
-    read -r -p "Telegram Bot Token（回车跳过，可稍后再填）: " TG_TOKEN
+if [[ -z "$TG_TOKEN" ]]; then
+    ask "Telegram Bot Token（回车跳过，可稍后再填）: " TG_TOKEN
 fi
-if [[ -t 0 && -z "$TG_ADMINS" && -n "$TG_TOKEN" ]]; then
-    read -r -p "允许操作的 Telegram 数字 ID（逗号分隔）: " TG_ADMINS
+if [[ -z "$TG_ADMINS" && -n "$TG_TOKEN" ]]; then
+    ask "允许操作的 Telegram 数字 ID（逗号分隔）: " TG_ADMINS
 fi
-if [[ -t 0 ]]; then
-    read -r -p "启用 QUIC 中继 UDP/443? [Y/n]: " _q
-    if [[ "$_q" == "n" || "$_q" == "N" ]]; then QUIC_ENABLED=0; fi
-fi
+ask "启用 QUIC 中继 UDP/443? [Y/n]: " _q
+if [[ "$_q" == "n" || "$_q" == "N" ]]; then QUIC_ENABLED=0; fi
 ADMIN_JSON="[]"
 if [[ -n "$TG_ADMINS" ]]; then
     ADMIN_JSON="[$(printf '%s' "$TG_ADMINS" | tr -d ' ')]"
@@ -146,6 +179,7 @@ install_mihomo() {
     fi
 }
 
+STEP="安装依赖"
 info "安装依赖..."
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -153,19 +187,25 @@ apt-get install -y -qq ca-certificates curl certbot gzip >/dev/null
 install_mihomo
 
 # ---------- 证书 ----------
+STEP="签发证书"
 if [[ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]]; then
     ok "复用已有证书"
 else
     if [[ -z "$EMAIL" ]]; then
-        read -r -p "Let's Encrypt 邮箱: " EMAIL
+        ask "Let's Encrypt 邮箱: " EMAIL
     fi
+    [[ -n "$EMAIL" ]] || { err "缺少邮箱，已中止。用 EMAIL=you@example.com bash install.sh 传入，或交互运行"; exit 1; }
     info "签发证书（需要公网 TCP/80 可达）..."
     systemctl stop nginx apache2 2>/dev/null || true
-    certbot certonly --standalone -d "$DOMAIN" --agree-tos -m "$EMAIL" --non-interactive
+    if ! certbot certonly --standalone -d "$DOMAIN" --agree-tos -m "$EMAIL" --non-interactive; then
+        err "证书签发失败。常见原因：$DOMAIN 的 A 记录没指向本机 / 公网 80 端口不可达 / 本机 80 端口被占用"
+        exit 1
+    fi
     ok "证书已签发"
 fi
 
 # ---------- 二进制 ----------
+STEP="安装二进制"
 case "$(uname -m)" in
     x86_64|amd64) ARCH=amd64 ;;
     aarch64|arm64) ARCH=arm64 ;;
@@ -188,6 +228,7 @@ else
 fi
 
 # ---------- 配置 ----------
+STEP="写入配置"
 mkdir -p "$CONF_DIR"
 if [[ -f "$CONF" ]]; then
     ok "配置已存在，保留: $CONF"
@@ -236,6 +277,7 @@ EOF
     ok "已写入 $CONF"
 fi
 
+STEP="写入规则"
 if [[ -f "$RULES" ]]; then
     ok "规则已存在，保留: $RULES"
 else
@@ -260,6 +302,7 @@ EOF
 fi
 
 # ---------- 服务 ----------
+STEP="注册并启动服务"
 cat > "$SERVICE" <<'EOF'
 [Unit]
 Description=dotmux split gateway (DoT + SNI)
@@ -291,7 +334,7 @@ for _ in $(seq 1 10); do
     sleep 1
 done
 if ! systemctl is-active --quiet dotmux; then
-    err "服务未启动，查看: journalctl -u dotmux -n 50 --no-pager"
+    err "服务未启动：journalctl -u dotmux -n 50 --no-pager 看具体原因"
     exit 1
 fi
 
@@ -299,9 +342,8 @@ ok "安装完成"
 cat <<EOF
 
   DoT 域名   : $DOMAIN:853
-  网关地址   : $GATEWAY_IP
-  客户端网段 : $CLIENT_CIDR
   网关地址   : $GATEWAY_IP（手机连这个）
+  客户端网段 : $CLIENT_CIDR
   默认出口   : $DEF_EXIT
   配置文件   : $CONF
   规则文件   : $RULES
