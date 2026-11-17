@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -359,6 +360,20 @@ func (c *Config) FindExit(name string) *Exit {
 		}
 	}
 	return nil
+}
+
+// ExitWorkDir 返回 mihomo 出口实例的工作目录。
+// 必须落在状态目录下：一是给绝对路径，避免 systemd 的 cwd=/ 把
+// 相对路径变成 /<出口名>；二是卸载时能连同缓存一起清掉。
+func (c *Config) ExitWorkDir() string {
+	base := filepath.Dir(c.Telegram.StateFile)
+	if base == "." || base == "" {
+		base = filepath.Dir(c.Rules.CacheDir)
+	}
+	if base == "." || base == "" {
+		base = "/var/lib/dotmux"
+	}
+	return filepath.Join(base, "exits")
 }
 
 // ClientNets 返回解析后的客户端网段，用于判断“是否给自己的设备服务”。

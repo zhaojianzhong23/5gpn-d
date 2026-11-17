@@ -122,8 +122,10 @@ func main() {
 
 	dyn := newDyn(cfg, *cfgPath)
 
-	// 代理内核：type=mihomo 的出口靠它落地成本地 socks5
-	mgr := newMihomoMgr(cfg.MihomoBin, "")
+	// 代理内核：type=mihomo 的出口靠它落地成本地 socks5。
+	// 实例目录必须给绝对路径——systemd 下 cwd 是 /，传相对路径会在根目录
+	// 建出以出口名命名的目录，卸载时也没人知道该删哪儿。
+	mgr := newMihomoMgr(cfg.MihomoBin, cfg.ExitWorkDir())
 	dyn.setProxy(mgr)
 	defer mgr.StopAll()
 	for _, e := range cfg.Exits {

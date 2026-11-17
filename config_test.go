@@ -160,3 +160,25 @@ func firstLocalIPv4() string {
 	}
 	return ""
 }
+
+// 出口内核的工作目录必须是绝对路径：systemd 下 cwd 是 /，
+// 相对路径会在根目录建出以出口名命名的目录。
+func TestExitWorkDir(t *testing.T) {
+	cases := []struct{ state, cache, want string }{
+		{"/var/lib/dotmux/tg-state.json", "/var/lib/dotmux/rules", "/var/lib/dotmux/exits"},
+		{"", "/var/lib/dotmux/rules", "/var/lib/dotmux/exits"},
+		{"", "", "/var/lib/dotmux/exits"},
+	}
+	for _, c := range cases {
+		cfg := &Config{}
+		cfg.Telegram.StateFile = c.state
+		cfg.Rules.CacheDir = c.cache
+		got := cfg.ExitWorkDir()
+		if got != c.want {
+			t.Fatalf("state=%q cache=%q -> %q，应为 %q", c.state, c.cache, got, c.want)
+		}
+		if !filepath.IsAbs(got) {
+			t.Fatalf("必须是绝对路径，得到 %q", got)
+		}
+	}
+}

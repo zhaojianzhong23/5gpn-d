@@ -370,6 +370,7 @@ cat <<EOF
   默认出口   : $DEF_EXIT
   配置文件   : $CONF
   规则文件   : $RULES
+  卸载脚本   : https://raw.githubusercontent.com/${REPO}/main/uninstall.sh
 
   端口放行（按你的防火墙工具二选一）：
     ufw allow 853/tcp && ufw allow 80/tcp && ufw allow 443/tcp && ufw allow 443/udp

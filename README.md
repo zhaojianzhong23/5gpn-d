@@ -70,6 +70,23 @@ sudo DOMAIN=dot.example.com EMAIL=you@example.com CLIENT_CIDR=172.22.0.0/16 \
 
 任何一步失败都会报出**卡在哪一阶段**，并提示主机可能处于半装状态，不会静默退出。
 
+### 卸载
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/zhaojianzhong23/5gpn-d/main/uninstall.sh -o uninstall.sh
+sudo bash uninstall.sh
+```
+
+默认删除：systemd 服务、`/usr/local/bin/dotmux`、`/etc/dotmux`、`/var/lib/dotmux`（规则缓存、Bot 状态、出口内核工作目录）。**配置在删除前会打包到 `/root/dotmux-backup-<时间>.tar.gz`**，想装回来解压回 `/etc/dotmux` 即可。
+
+| 参数 | 作用 |
+|---|---|
+| `--keep-config` | 保留 `/etc/dotmux`，只删程序和缓存 |
+| `--purge` | 连 Let's Encrypt 证书和 `mihomo` 一起删（`mihomo` 会再单独问一次） |
+| `-y` / `--yes` | 不询问，直接执行 |
+
+证书和 `mihomo` 默认保留：前者可能还有别的服务在用，后者可能是你自己装的。防火墙端口和域名 A 记录脚本不动，结束时会把这两条列出来提醒。重复执行是安全的，没装过会直接提示「无需卸载」。
+
 ## 配置
 
 `/etc/dotmux/config.json`（权限 600，含 Bot token）：
