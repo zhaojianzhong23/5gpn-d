@@ -9,6 +9,8 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/miekg/dns"
@@ -19,6 +21,37 @@ type snipSvc struct {
 	rules func() *RuleSet
 	dyn   *Dyn
 	nets  []*net.IPNet
+
+	tlsUp  atomic.Bool
+	httpUp atomic.Bool
+}
+
+// sniCurrent 指向当前存活的 SNI 服务，供健康检查读取真实监听状态。
+var sniCurrent atomic.Pointer[snipSvc]
+
+// sniAlive 报告 SNI 转发是否真的在 accept。
+// 以前这里读的是启动时的快照，443 挂了 Bot 照样显示绿色。
+func sniAlive() bool {
+	s := sniCurrent.Load()
+	if s == nil {
+		return false
+	}
+	return s.alive(true) || s.alive(false)
+}
+
+func (s *snipSvc) alive(isTLS bool) bool {
+	if isTLS {
+		return s.tlsUp.Load()
+	}
+	return s.httpUp.Load()
+}
+
+func (s *snipSvc) setAlive(isTLS bool, v bool) {
+	if isTLS {
+		s.tlsUp.Store(v)
+	} else {
+		s.httpUp.Store(v)
+	}
 }
 
 func newSnipSvc(cfg *Config, rules func() *RuleSet, dyn *Dyn) *snipSvc {
@@ -28,6 +61,7 @@ func newSnipSvc(cfg *Config, rules func() *RuleSet, dyn *Dyn) *snipSvc {
 // startSNI 监听 443 / 80，按 SNI 或 Host 还原目标后转发。
 func startSNI(cfg *Config, rules func() *RuleSet, dyn *Dyn) error {
 	s := newSnipSvc(cfg, rules, dyn)
+	sniCurrent.Store(s)
 	listeners := []struct {
 		addr  string
 		isTLS bool
@@ -42,11 +76,12 @@ func startSNI(cfg *Config, rules func() *RuleSet, dyn *Dyn) error {
 		}
 		ln, err := net.Listen("tcp", l.addr)
 		if err != nil {
+			// 启动阶段就失败：照样交给 supervise 一直重试，不再「假活」。
 			logf("error", "监听 %s 失败: %v", l.addr, err)
+			go s.supervise(l.addr, l.isTLS, nil)
 			continue
 		}
-		go s.acceptLoop(ln, l.isTLS)
-		logf("info", "SNI 转发监听 %s (tls=%v)", l.addr, l.isTLS)
+		go s.supervise(l.addr, l.isTLS, ln)
 		ok++
 	}
 	if ok == 0 {
@@ -55,17 +90,91 @@ func startSNI(cfg *Config, rules func() *RuleSet, dyn *Dyn) error {
 	return nil
 }
 
-func (s *snipSvc) acceptLoop(ln net.Listener, isTLS bool) {
+// supervise 保证某个监听口始终在线：
+// accept 出错（fd 用尽、连接被重置）只退避，不退出；连 listener 都没了
+// （GC 回收、被外部关掉）就重新 bind。以前 acceptLoop 一 return，
+// 没人持有 listener 就会被回收，443 就这么静悄悄消失了。
+func (s *snipSvc) supervise(addr string, isTLS bool, first net.Listener) {
+	backoff := 50 * time.Millisecond
+	fails := 0
+	ln := first
 	for {
-		conn, err := ln.Accept()
-		if err != nil {
-			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		if ln == nil {
+			var err error
+			ln, err = net.Listen("tcp", addr)
+			if err != nil {
+				s.setAlive(isTLS, false)
+				// 80 端口常年被占是已知情况，别每 2 秒刷一行日志
+				if fails == 0 || fails%30 == 0 {
+					logf("error", "监听 %s 失败: %v（%s 后重试）", addr, err, backoff)
+				}
+				fails++
+				time.Sleep(backoff)
+				if backoff < 2*time.Second {
+					backoff *= 2
+					if backoff > 2*time.Second {
+						backoff = 2 * time.Second
+					}
+				}
 				continue
 			}
-			return
 		}
-		go s.handle(conn, isTLS)
+		backoff = 50 * time.Millisecond
+		fails = 0
+		s.setAlive(isTLS, true)
+		logf("info", "SNI 转发监听 %s (tls=%v)", addr, isTLS)
+
+		err := s.acceptLoop(ln, isTLS)
+		s.setAlive(isTLS, false)
+		_ = ln.Close()
+		ln = nil
+		logf("warn", "监听 %s 退出: %v，正在重建", addr, err)
 	}
+}
+
+func (s *snipSvc) acceptLoop(ln net.Listener, isTLS bool) error {
+	var delay time.Duration
+	for {
+		conn, err := ln.Accept()
+		if err == nil {
+			delay = 0
+			go s.handle(conn, isTLS)
+			continue
+		}
+		// listener 真的被关了，交回给 supervise
+		if errors.Is(err, net.ErrClosed) {
+			return err
+		}
+		if !transientAccept(err) {
+			return err
+		}
+		if delay == 0 {
+			delay = 50 * time.Millisecond
+		} else if delay < 2*time.Second {
+			delay *= 2
+		}
+		logf("warn", "accept %s 失败: %v（%s 后重试）", ln.Addr(), err, delay)
+		time.Sleep(delay)
+	}
+}
+
+// transientAccept 判断 accept 错误是不是「歇一下就好了」的类型。
+// EMFILE/ENFILE（fd 用尽）是最常见的：短时间连接暴涨就会撞上，
+// 这时候退出监听等于把整个 443 关掉。
+func transientAccept(err error) bool {
+	for _, e := range []error{
+		syscall.EMFILE, syscall.ENFILE, syscall.ECONNABORTED,
+		syscall.EINTR, syscall.ENOBUFS, syscall.ENOMEM, syscall.EPERM,
+	} {
+		if errors.Is(err, e) {
+			return true
+		}
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return true
+	}
+	return false
 }
 
 func (s *snipSvc) handle(c net.Conn, isTLS bool) {
