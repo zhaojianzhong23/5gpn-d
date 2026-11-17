@@ -525,16 +525,22 @@ func DialVia(e Exit, host string, port int, timeout time.Duration, remoteDNS fun
 	return net.DialTimeout("tcp", net.JoinHostPort(ip.String(), itoa(port)), timeout)
 }
 
-// 探测目标。做成变量只为让测试能指向本地 TLS 服务，
-// 生产路径永远是 api.ipify.org:443。
+// 探测目标。做成变量只为让测试能指向本地 TLS 服务。
+//
+// 这里用 Cloudflare 的 cdn-cgi/trace 而不是 api.ipify.org：trace 由边缘节点
+// 直接应答（东京实测 20ms 左右，回包首行就带 ip=），
+// 而 api.ipify.org 每次要绕回源站，光服务器自己的响应就 170ms 上下——
+// 用它当基准，Bot 上显示的「合计」几乎全是对方站点的处理时间，
+// 会被误读成「出口/专线慢」。
 var (
-	probeTarget = "api.ipify.org:443"
+	probeTarget = "1.1.1.1:443"
+	probePath   = "/cdn-cgi/trace"
 	probeVerify = true
 )
 
-// Probe 通过出口访问 ipify，拿出口公网 IP 与耗时。
+// Probe 通过出口访问探测目标，拿出口公网 IP 与耗时。
 //
-// 注意这个耗时是「本机 → 出口 → api.ipify.org → 回来」的全程：
+// 注意这个耗时是「本机 → 出口 → 边缘节点 → 回来」的全程：
 // 建连（含 socks5 握手）+ TLS 握手 + 首个响应字节，跟手机到本机的
 // 内网延迟完全是两回事，Bot 里要分开说明，否则很容易误读。
 func (d *Dyn) Probe(name string) ProbeResult {
@@ -561,7 +567,7 @@ func (d *Dyn) Probe(name string) ProbeResult {
 	cli := &http.Client{Transport: tr, Timeout: 10 * time.Second}
 	res := ProbeResult{At: start}
 
-	req, rerr := http.NewRequest("GET", "https://"+probeTarget, nil)
+	req, rerr := http.NewRequest("GET", "https://"+probeTarget+probePath, nil)
 	var (
 		resp *http.Response
 		err  error
@@ -584,11 +590,14 @@ func (d *Dyn) Probe(name string) ProbeResult {
 	if err != nil {
 		res.Err = err.Error()
 	} else {
-		body, _ := io.ReadAll(io.LimitReader(resp.Body, 128))
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		resp.Body.Close()
-		res.IP = strings.TrimSpace(string(body))
-		if resp.StatusCode != 200 || res.IP == "" {
+		res.IP = parseExitIP(string(body))
+		switch {
+		case resp.StatusCode != 200:
 			res.Err = fmt.Sprintf("HTTP %d", resp.StatusCode)
+		case res.IP == "":
+			res.Err = "响应里没有出口 IP"
 		}
 	}
 	res.Dial, res.TLS = dial, tlsHs
@@ -597,6 +606,23 @@ func (d *Dyn) Probe(name string) ProbeResult {
 	d.probe[name] = res
 	d.mu.Unlock()
 	return res
+}
+
+// parseExitIP 从探测响应里取出出口公网 IP。
+//
+// cdn-cgi/trace 的 body 是每行一个 key=value，其中一行是 ip=；
+// 另外兜住「自建回显服务只回一个裸 IP」的情况（测试用的就是这种），
+// 两种都能取到，取不到就返回空串，交给调用方报错。
+func parseExitIP(body string) string {
+	for _, f := range strings.Fields(body) {
+		if v, ok := strings.CutPrefix(f, "ip="); ok && v != "" {
+			return v
+		}
+	}
+	if ip := strings.TrimSpace(body); net.ParseIP(ip) != nil {
+		return ip
+	}
+	return ""
 }
 
 // ProbeCache 返回缓存的探测结果。

@@ -48,3 +48,20 @@ func TestProbeRecordsPhases(t *testing.T) {
 		t.Fatalf("展示文案没体现分段：%s", line)
 	}
 }
+
+// 探测目标换成 cdn-cgi/trace 之后，回包是每行一个 key=value，
+// 得从里面挑出 ip=，不能像以前那样把整个 body 当 IP 用。
+func TestParseExitIPTraceFormat(t *testing.T) {
+	cases := []struct{ name, body, want string }{
+		{"trace 多行", "fl=448f645\nh=1.1.1.1\nip=203.0.113.7\nts=1794922015.0\nvisit_scheme=https\n", "203.0.113.7"},
+		{"trace 单行", "fl=abc h=1.1.1.1 ip=198.51.100.2 ts=1", "198.51.100.2"},
+		{"裸 IP（自建回显）", "203.0.113.9\n", "203.0.113.9"},
+		{"没有 ip=", "ok\n", ""},
+		{"空响应", "", ""},
+	}
+	for _, c := range cases {
+		if got := parseExitIP(c.body); got != c.want {
+			t.Errorf("%s: parseExitIP(%q) = %q, want %q", c.name, c.body, got, c.want)
+		}
+	}
+}
