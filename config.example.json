@@ -1,0 +1,19 @@
+{
+  "listen": {
+    "dot": ":853",
+    "tls": ":443",
+    "http": ":80"
+  },
+  "cert_file": "/etc/letsencrypt/live/dot.example.com/fullchain.pem",
+  "key_file": "/etc/letsencrypt/live/dot.example.com/privkey.pem",
+  "gateway_ip": "203.0.113.10",
+  "client_cidr": ["172.22.0.0/16"],
+  "upstream_dns": ["223.5.5.5:53", "119.29.29.29:53"],
+  "socks5": "127.0.0.1:1080",
+  "rules_file": "/etc/dotmux/rules.conf",
+  "cache_size": 8192,
+  "synthetic_ttl": 60,
+  "log": {
+    "level": "info"
+  }
+}

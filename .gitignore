@@ -1,0 +1,6 @@
+/dotmux
+/dotmux-linux-*
+*.pem
+*.key
+*.mobileconfig
+.DS_Store

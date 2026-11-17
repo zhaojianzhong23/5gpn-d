@@ -1,0 +1,178 @@
+#!/usr/bin/env bash
+# dotmux 安装脚本：Debian 12+ / Ubuntu 22.04+
+set -euo pipefail
+
+REPO="${REPO:-zhaojianzhong23/dotmux}"
+BIN=/usr/local/bin/dotmux
+CONF_DIR=/etc/dotmux
+CONF="$CONF_DIR/config.json"
+RULES="$CONF_DIR/rules.conf"
+SERVICE=/etc/systemd/system/dotmux.service
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; BLUE='\033[0;34m'; NC='\033[0m'
+info() { printf "${BLUE}[INFO]${NC} %s\n" "$*"; }
+ok()   { printf "${GREEN}[ OK ]${NC} %s\n" "$*"; }
+err()  { printf "${RED}[ERR ]${NC} %s\n" "$*" >&2; }
+
+[[ $EUID -eq 0 ]] || { err "请用 root 运行"; exit 1; }
+command -v systemctl >/dev/null || { err "需要 systemd"; exit 1; }
+
+DOMAIN="${DOMAIN:-}"
+EMAIL="${EMAIL:-}"
+GATEWAY_IP="${GATEWAY_IP:-}"
+CLIENT_CIDR="${CLIENT_CIDR:-172.22.0.0/16}"
+SOCKS5="${SOCKS5:-}"
+
+if [[ -z "$DOMAIN" ]]; then
+    read -r -p "DoT 域名（A 记录已指向本机）: " DOMAIN
+fi
+[[ -n "$DOMAIN" ]] || { err "域名不能为空"; exit 1; }
+
+if [[ -z "$GATEWAY_IP" ]]; then
+    GATEWAY_IP="$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+fi
+if [[ -z "$GATEWAY_IP" ]]; then
+    read -r -p "本机公网 IPv4: " GATEWAY_IP
+fi
+[[ -n "$GATEWAY_IP" ]] || { err "需要公网 IPv4"; exit 1; }
+
+info "安装依赖..."
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+apt-get install -y -qq ca-certificates curl certbot >/dev/null
+
+# ---------- 证书 ----------
+if [[ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]]; then
+    ok "复用已有证书"
+else
+    if [[ -z "$EMAIL" ]]; then
+        read -r -p "Let's Encrypt 邮箱: " EMAIL
+    fi
+    info "签发证书（需要公网 TCP/80 可达）..."
+    systemctl stop nginx apache2 2>/dev/null || true
+    certbot certonly --standalone -d "$DOMAIN" --agree-tos -m "$EMAIL" --non-interactive
+    ok "证书已签发"
+fi
+
+# ---------- 二进制 ----------
+case "$(uname -m)" in
+    x86_64|amd64) ARCH=amd64 ;;
+    aarch64|arm64) ARCH=arm64 ;;
+    *) err "不支持的架构: $(uname -m)"; exit 1 ;;
+esac
+
+info "安装二进制..."
+if [[ -x "$(dirname "$0")/dotmux" ]]; then
+    install -m 0755 "$(dirname "$0")/dotmux" "$BIN"
+    ok "使用本地构建的二进制"
+else
+    URL="https://github.com/$REPO/releases/latest/download/dotmux-linux-$ARCH"
+    if curl -fsSL --max-time 60 "$URL" -o "$BIN.tmp"; then
+        install -m 0755 "$BIN.tmp" "$BIN" && rm -f "$BIN.tmp"
+        ok "已下载 $ARCH 版本"
+    else
+        err "下载失败。请先在本地 go build 后同目录执行本脚本，或先发一个 Release。"
+        exit 1
+    fi
+fi
+
+# ---------- 配置 ----------
+mkdir -p "$CONF_DIR"
+if [[ -f "$CONF" ]]; then
+    ok "配置已存在，保留: $CONF"
+else
+    umask 077
+    cat > "$CONF" <<EOF
+{
+  "listen": { "dot": ":853", "tls": ":443", "http": ":80" },
+  "cert_file": "/etc/letsencrypt/live/$DOMAIN/fullchain.pem",
+  "key_file": "/etc/letsencrypt/live/$DOMAIN/privkey.pem",
+  "gateway_ip": "$GATEWAY_IP",
+  "client_cidr": ["$CLIENT_CIDR"],
+  "upstream_dns": ["223.5.5.5:53", "119.29.29.29:53"],
+  "socks5": "$SOCKS5",
+  "rules_file": "$RULES",
+  "cache_size": 8192,
+  "synthetic_ttl": 60,
+  "log": { "level": "info" }
+}
+EOF
+    ok "已写入 $CONF"
+fi
+
+if [[ -f "$RULES" ]]; then
+    ok "规则已存在，保留: $RULES"
+else
+    cat > "$RULES" <<'EOF'
+# 格式：类型,值,动作   动作 = direct | proxy | block
+# 未命中任何规则时走 FINAL。
+
+DOMAIN-SUFFIX,openai.com,proxy
+DOMAIN-SUFFIX,anthropic.com,proxy
+DOMAIN-SUFFIX,youtube.com,proxy
+DOMAIN-SUFFIX,googlevideo.com,proxy
+DOMAIN-SUFFIX,twitter.com,proxy
+DOMAIN-SUFFIX,telegram.org,proxy
+DOMAIN-SUFFIX,github.com,proxy
+DOMAIN-KEYWORD,doubleclick,block
+
+FINAL,direct
+EOF
+    ok "已写入示例规则 $RULES（按需修改）"
+fi
+
+# ---------- 服务 ----------
+cat > "$SERVICE" <<'EOF'
+[Unit]
+Description=dotmux split gateway (DoT + SNI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/dotmux -c /etc/dotmux/config.json
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=3
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+LimitNOFILE=65535
+NoNewPrivileges=yes
+ProtectHome=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now dotmux >/dev/null 2>&1 || systemctl restart dotmux
+
+info "等待服务就绪..."
+for _ in $(seq 1 10); do
+    if systemctl is-active --quiet dotmux; then break; fi
+    sleep 1
+done
+if ! systemctl is-active --quiet dotmux; then
+    err "服务未启动，查看: journalctl -u dotmux -n 50 --no-pager"
+    exit 1
+fi
+
+ok "安装完成"
+cat <<EOF
+
+  DoT 域名   : $DOMAIN:853
+  网关地址   : $GATEWAY_IP
+  客户端网段 : $CLIENT_CIDR
+  配置文件   : $CONF
+  规则文件   : $RULES
+
+  端口放行（按你的防火墙工具二选一）：
+    ufw allow 853/tcp && ufw allow 80/tcp && ufw allow 443/tcp
+    nft add rule inet filter input tcp dport { 80, 443, 853 } accept
+
+  改完规则热重载：systemctl reload dotmux
+  看日志        ：journalctl -u dotmux -f
+
+  iPhone : 需要描述文件指向 $DOMAIN，见 README 的「客户端接入」
+  Android: 设置 → 私人 DNS → 填 $DOMAIN
+EOF
