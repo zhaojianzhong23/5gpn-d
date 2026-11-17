@@ -29,6 +29,9 @@ type snipSvc struct {
 	httpUp atomic.Bool
 
 	inflight atomic.Int64
+	// guest 是非托管来源的并发占用，单独计数：扫描器打的是这个额度，
+	// 不会把自家设备那条路挤掉。
+	guest atomic.Int64
 	// 自环丢弃日志限流：扫描器会持续打同一个地址，不压一下会把 journal 刷满
 	selfDropLast   atomic.Int64
 	selfDropLogged atomic.Int64
@@ -39,8 +42,15 @@ type snipSvc struct {
 //
 // 这个值不能调小：公网扫描器能轻松打到几千并发，上限一低，被丢掉的
 // 就是自己手机的连接（日志里「并发连接已达上限」每次都是这个含义）。
-// 真正的解法是不给非托管来源进来的机会，而不是把闸门压低。
+// 真正的解法是给非托管来源单开一道闸，而不是把总闸压低。
 const maxInflight = 4096
+
+// maxInflightGuest 是非托管来源独占的并发额度。
+//
+// 这里刻意不「一刀切拒绝」：自己家 Wi-Fi 经路由器代理回程、别人的设备、
+// 公网扫描器，从网关角度看都是非托管来源，拒掉会连自家那条路一起断掉。
+// 只限流的话，扫描器吃掉这 512 条就再也进不来，托管流量和家里那条路都还在。
+const maxInflightGuest = 512
 
 // selfAddrs 保存本机所有 IPv4 地址。转发前先比对一下：
 // 扫描器经常拿 VPS 自己的 IP 或域名当 Host 打 :80/:443，
@@ -252,13 +262,25 @@ func (s *snipSvc) handle(c net.Conn, isTLS bool) {
 	start := time.Now()
 	defer c.Close()
 
+	remoteIP := remoteIPOf(c)
+	managed := inNets(remoteIP, s.nets)
+
 	// fd 用满是致命状态：这里先挡一道，宁可丢几条连接也别把进程拖死。
+	// 非托管来源先过它自己的额度，扫描器就吃不掉整台机器。
+	if !managed && s.guest.Load() >= maxInflightGuest {
+		logf("warn", "非托管来源并发已达上限 %d，丢弃 %s 的新连接", maxInflightGuest, c.RemoteAddr())
+		return
+	}
 	if s.inflight.Load() >= maxInflight {
 		logf("warn", "并发连接已达上限 %d，丢弃 %s 的新连接", maxInflight, c.RemoteAddr())
 		return
 	}
 	s.inflight.Add(1)
 	defer s.inflight.Add(-1)
+	if !managed {
+		s.guest.Add(1)
+		defer s.guest.Add(-1)
+	}
 
 	_ = c.SetReadDeadline(time.Now().Add(15 * time.Second))
 
@@ -274,9 +296,6 @@ func (s *snipSvc) handle(c net.Conn, isTLS bool) {
 	if !isTLS && s.acmeChallenge(c, br) {
 		return
 	}
-
-	remoteIP := remoteIPOf(c)
-	managed := inNets(remoteIP, s.nets)
 
 	port := 443
 	if !isTLS {
