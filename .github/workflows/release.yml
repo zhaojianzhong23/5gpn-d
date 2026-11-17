@@ -4,6 +4,12 @@ on:
   push:
     tags:
       - "v*"
+  # 打标签没触发、或想补发某个版本时，可以在 Actions 页面手动跑。
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的标签，例如 v0.4.4（必须已存在）"
+        required: true
 
 permissions:
   contents: write
@@ -13,6 +19,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref }}
 
       - uses: actions/setup-go@v5
         with:
@@ -22,18 +30,21 @@ jobs:
         run: go test ./...
 
       - name: Build
+        env:
+          VER: ${{ github.event.inputs.tag || github.ref_name }}
         run: |
           set -e
           for arch in amd64 arm64; do
             CGO_ENABLED=0 GOOS=linux GOARCH=$arch \
               go build -trimpath \
-              -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
+              -ldflags "-s -w -X main.version=${VER}" \
               -o dotmux-linux-$arch .
             sha256sum dotmux-linux-$arch > dotmux-linux-$arch.sha256
           done
 
       - uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ github.event.inputs.tag || github.ref_name }}
           files: |
             dotmux-linux-amd64
             dotmux-linux-amd64.sha256
