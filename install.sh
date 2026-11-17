@@ -482,7 +482,7 @@ else
   "client_cidr": ["$CLIENT_CIDR"],
   "ecs": "${ECS:-139.226.48.1}",
   "remote_dns": ["1.1.1.1", "8.8.8.8", "9.9.9.9"],
-  "local_dns": ["101.226.4.6", "218.30.118.6", "180.76.76.76", "119.29.29.29"],
+  "local_dns": ["223.5.5.5", "119.29.29.29", "223.6.6.6"],
   "mihomo_bin": "/usr/local/bin/mihomo",
   "exits": $EXITS_JSON,
   "default_exit": "$DEF_EXIT",

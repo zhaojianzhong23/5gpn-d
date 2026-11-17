@@ -112,14 +112,18 @@ func (s *dnsSvc) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	q := req.Question[0]
 	name := strings.ToLower(strings.TrimSuffix(q.Name, "."))
 
+	var src net.IP
 	private := false
 	if ap, ok := w.RemoteAddr().(*net.TCPAddr); ok {
+		src = ap.IP
 		private = inNets(ap.IP, s.nets)
 	}
 
 	// 非托管来源一律按真实地址解析，保证不影响其它使用者。
+	// 但解析要带上它自己的网段：网关在境外，国内递归看到的是 VPS 的地址，
+	// 不带 ECS 就会把国内域名调度到海外节点，客户端照着直连只会更慢甚至打不开。
 	if !private {
-		s.forward(w, req, false)
+		s.forward(w, req, ecsFromSource(src))
 		return
 	}
 
@@ -130,7 +134,7 @@ func (s *dnsSvc) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	case dns.TypeA:
 	default:
-		s.forward(w, req, s.ecs != nil)
+		s.forward(w, req, s.ecs)
 		return
 	}
 
@@ -147,7 +151,7 @@ func (s *dnsSvc) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		s.replyA(w, req, q, s.gatewayV4, s.cfg.SyntheticTTL)
 		return
 	default:
-		s.forward(w, req, s.ecs != nil)
+		s.forward(w, req, s.ecs)
 	}
 }
 
@@ -183,15 +187,15 @@ func attachEDNS(resp, req *dns.Msg) {
 	}
 }
 
-func (s *dnsSvc) forward(w dns.ResponseWriter, req *dns.Msg, useECS bool) {
-	key := cacheKey(req)
+func (s *dnsSvc) forward(w dns.ResponseWriter, req *dns.Msg, ecs net.IP) {
+	key := cacheKey(req, ecs)
 	if r := s.cache.get(key); r != nil {
 		r.Id = req.Id
 		_ = w.WriteMsg(r)
 		return
 	}
 
-	resp, err := s.exchange(req, useECS)
+	resp, err := s.exchange(req, ecs)
 	if err != nil {
 		logf("warn", "上游解析失败 q=%s: %v", req.Question[0].Name, err)
 		s.replyEmpty(w, req, dns.RcodeServerFailure)
@@ -207,14 +211,14 @@ func (s *dnsSvc) forward(w dns.ResponseWriter, req *dns.Msg, useECS bool) {
 	_ = w.WriteMsg(resp)
 }
 
-func (s *dnsSvc) exchange(req *dns.Msg, useECS bool) (*dns.Msg, error) {
+func (s *dnsSvc) exchange(req *dns.Msg, ecs net.IP) (*dns.Msg, error) {
 	_, local := s.dyn.DNS()
 	if len(local) == 0 {
 		local = s.cfg.LocalDNS
 	}
 	q := req
-	if useECS && s.ecs != nil {
-		q = withECS(req, s.ecs)
+	if ecs != nil {
+		q = withECS(req, ecs)
 	}
 	var lastErr error
 	for _, up := range local {
@@ -267,12 +271,50 @@ func withECS(req *dns.Msg, ip net.IP) *dns.Msg {
 	return m
 }
 
-func cacheKey(m *dns.Msg) string {
+// ecsFromSource 把客户端来源地址折算成发给递归 DNS 的 ECS 网段。
+//
+// 只取 /24：足够把 CDN 定位到城域网，又不至于把具体某一台设备暴露给上游；
+// 私网、回环、保留地址一律不带，免得上游按无效网段调度。
+func ecsFromSource(ip net.IP) net.IP {
+	v4 := ip.To4()
+	if v4 == nil || !isPublicV4(v4) {
+		return nil
+	}
+	return v4.Mask(net.CIDRMask(24, 32))
+}
+
+var nonPublicV4 = func() []*net.IPNet {
+	var out []*net.IPNet
+	for _, s := range []string{
+		"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+		"169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24",
+		"192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24",
+		"203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
+	} {
+		if _, n, err := net.ParseCIDR(s); err == nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}()
+
+func isPublicV4(ip net.IP) bool {
+	return ip.To4() != nil && !inNets(ip, nonPublicV4)
+}
+
+// cacheKey 生成缓存键。带 ECS 时把网段一起编进去。
+func cacheKey(m *dns.Msg, ecs net.IP) string {
 	if len(m.Question) == 0 {
 		return ""
 	}
 	q := m.Question[0]
-	return strings.ToLower(q.Name) + "|" + dns.TypeToString[q.Qtype]
+	k := strings.ToLower(q.Name) + "|" + dns.TypeToString[q.Qtype]
+	// 不同 ECS 拿到的 CDN 节点不同，缓存必须按网段分开，否则会把别人的就近
+	// 结果发给当前客户端。
+	if ecs != nil {
+		k += "|" + ecs.String()
+	}
+	return k
 }
 
 func minTTL(m *dns.Msg) uint32 {

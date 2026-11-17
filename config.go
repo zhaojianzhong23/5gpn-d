@@ -12,10 +12,10 @@ import (
 
 // Config 是 /etc/dotmux/config.json 的结构。
 type Config struct {
-	Listen    Listen `json:"listen"`
-	Domain    string `json:"domain"`
-	CertFile  string `json:"cert_file"`
-	KeyFile   string `json:"key_file"`
+	Listen   Listen `json:"listen"`
+	Domain   string `json:"domain"`
+	CertFile string `json:"cert_file"`
+	KeyFile  string `json:"key_file"`
 	// ACMEWebroot 是 80 端口上 /.well-known/acme-challenge/ 的取文件目录。
 	// 有它就不用为了续期停服务：certbot 走 --webroot，dotmux 自己把 challenge 吐出去，
 	// 不会出现「按 Host 转发 → 转给自己 → 死循环」。
@@ -132,7 +132,7 @@ func defaultConfig() *Config {
 	c.ECS = "139.226.48.1"
 	c.MihomoBin = "/usr/local/bin/mihomo"
 	c.UpstreamDNS = []string{"223.5.5.5:53", "119.29.29.29:53"}
-	c.LocalDNS = []string{"101.226.4.6", "218.30.118.6", "180.76.76.76", "119.29.29.29"}
+	c.LocalDNS = []string{"223.5.5.5", "119.29.29.29", "223.6.6.6"}
 	c.RemoteDNS = []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"}
 	c.Exits = []Exit{{Name: ExitDirect, Type: "direct"}}
 	c.DefaultExit = ExitDirect
