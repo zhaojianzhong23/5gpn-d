@@ -64,11 +64,8 @@ if [[ -z "$DOMAIN" ]]; then
 fi
 [[ -n "$DOMAIN" ]] || { err "缺少域名，已中止。用 DOMAIN=dot.example.com bash install.sh 传入，或交互运行"; exit 1; }
 
-# 这个字段决定“哪些来源算我的设备”，填错整套分流都不生效，先问清楚。
-# 手机卡给的是单个 IP 也能直接填，程序会按 /32 处理。
-if [[ -z "$CLIENT_CIDR" ]]; then
-    ask "手机卡内网 IP 或网段（如 172.22.1.10，回车用 172.22.0.0/16）: " CLIENT_CIDR
-fi
+# 网段不提问：绝大多数人就是 172.22.0.0/16，填单 IP 也按 /32 处理。
+# 少数派用 CLIENT_CIDR=10.8.0.0/24 传入，别为了这一种情况每次都拦一道。
 CLIENT_CIDR="${CLIENT_CIDR:-172.22.0.0/16}"
 
 # 定向内网卡的 VPS 侧通常也有一个同段私网地址，它比公网 IP 更适合写进 DNS 应答：
@@ -108,20 +105,22 @@ if [[ -z "$GATEWAY_IP" ]]; then
         warn "本机没有落在 $CLIENT_CIDR 内的地址，网关地址暂用公网 IP $GATEWAY_IP"
     fi
 fi
+# 只有探测和公网 IP 都拿不到时才问；正常装不会多拦一道确认。
 if [[ -z "$GATEWAY_IP" ]]; then
     ask "手机能访问到的网关 IPv4: " GATEWAY_IP
 fi
-ask "  网关地址（手机会连这个）[$GATEWAY_IP]: " _gw
-if [[ -n "$_gw" ]]; then GATEWAY_IP="$_gw"; fi
 
 if [[ -z "$TG_TOKEN" ]]; then
-    ask "Telegram Bot Token（回车跳过，可稍后再填）: " TG_TOKEN
+    ask "Telegram Bot Token（回车跳过，可稍后在 Bot 或 config.json 里填）: " TG_TOKEN
 fi
 if [[ -z "$TG_ADMINS" && -n "$TG_TOKEN" ]]; then
     ask "允许操作的 Telegram 数字 ID（逗号分隔）: " TG_ADMINS
 fi
-ask "启用 QUIC 中继 UDP/443? [Y/n]: " _q
-if [[ "$_q" == "n" || "$_q" == "N" ]]; then QUIC_ENABLED=0; fi
+# 邮箱放在这里问，而不是等到证书那一步：所有提问集中在开头，
+# 用户答完就能走开，不会在 apt 输出后面突然被拦一下。
+if [[ -z "$EMAIL" && ! -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]]; then
+    ask "Let's Encrypt 邮箱（回车跳过，证书到期在 Bot 里也能看）: " EMAIL
+fi
 ADMIN_JSON="[]"
 if [[ -n "$TG_ADMINS" ]]; then
     ADMIN_JSON="[$(printf '%s' "$TG_ADMINS" | tr -d ' ')]"
@@ -191,13 +190,16 @@ STEP="签发证书"
 if [[ -f "/etc/letsencrypt/live/$DOMAIN/fullchain.pem" ]]; then
     ok "复用已有证书"
 else
-    if [[ -z "$EMAIL" ]]; then
-        ask "Let's Encrypt 邮箱: " EMAIL
-    fi
-    [[ -n "$EMAIL" ]] || { err "缺少邮箱，已中止。用 EMAIL=you@example.com bash install.sh 传入，或交互运行"; exit 1; }
     info "签发证书（需要公网 TCP/80 可达）..."
     systemctl stop nginx apache2 2>/dev/null || true
-    if ! certbot certonly --standalone -d "$DOMAIN" --agree-tos -m "$EMAIL" --non-interactive; then
+    cert_args=(certonly --standalone -d "$DOMAIN" --agree-tos --non-interactive)
+    if [[ -n "$EMAIL" ]]; then
+        cert_args+=(-m "$EMAIL")
+    else
+        # 没留邮箱就无邮箱注册，别为了收提醒把安装卡在这里
+        cert_args+=(--register-unsafely-without-email)
+    fi
+    if ! certbot "${cert_args[@]}"; then
         err "证书签发失败。常见原因：$DOMAIN 的 A 记录没指向本机 / 公网 80 端口不可达 / 本机 80 端口被占用"
         exit 1
     fi
