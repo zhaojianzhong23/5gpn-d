@@ -180,3 +180,44 @@ func TestAllFormatsFail(t *testing.T) {
 		t.Fatalf("错误信息应说明尝试过哪些格式：%v", err)
 	}
 }
+
+// Loyalsoldier/clash-rules 的 proxy.txt / reject.txt 是 YAML 域名列表：
+//
+//	payload:
+//	  - '1password.drift.click'
+//
+// 既没有 DOMAIN-SUFFIX 前缀（不是 clash 语法），也不是干净的一行一域名。
+// 之前这种内容在 clash / domain / gfwlist / dnsmasq 下全是 0 条，日志报
+// 「解析结果为空（已尝试...）」，而 URL 明明是 200、内容也是对的。
+func TestYAMLPayloadList(t *testing.T) {
+	body := "payload:\n" +
+		"  - '1password.drift.click'\n" +
+		`  - "adobe.com"` + "\n" +
+		"  - plain.example.org\n" +
+		"  - .leading.dot.com\n" +
+		"  - '+.wild.example.com'\n" +
+		"  - '||block.example.net^'\n" +
+		"  # 注释行\n" +
+		"  - 'single'\n"
+
+	rules, used, err := parseRemoteBodyFmt([]byte(body), RemoteSource{Action: "proxy"})
+	if err != nil {
+		t.Fatalf("应当解析成功：%v", err)
+	}
+	if used != "domain" {
+		t.Fatalf("实际格式 = %q，应为 domain", used)
+	}
+	want := []string{"1password.drift.click", "adobe.com", "plain.example.org", "leading.dot.com",
+		"wild.example.com", "block.example.net"}
+	if len(rules) != len(want) {
+		t.Fatalf("解析出 %d 条（%+v），应为 %d 条", len(rules), rules, len(want))
+	}
+	for i := range want {
+		if rules[i].Value != want[i] {
+			t.Fatalf("第 %d 条 = %q，应为 %q", i, rules[i].Value, want[i])
+		}
+		if rules[i].Type != "DOMAIN-SUFFIX" {
+			t.Fatalf("第 %d 条类型 = %q", i, rules[i].Type)
+		}
+	}
+}
