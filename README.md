@@ -169,6 +169,7 @@ DOMAIN,exact.example.com,direct
 DOMAIN-SUFFIX,openai.com,proxy
 DOMAIN-SUFFIX,netflix.com,proxy:香港
 DOMAIN-KEYWORD,doubleclick,block
+DOMAIN-SUFFIX,cn,direct
 FINAL,proxy
 ```
 
@@ -176,6 +177,10 @@ FINAL,proxy
 - **`FINAL` 建议配成 `proxy`，配合国内直连表使用**：命中国内表 → 直连，其余一律走网关。
   配成 `FINAL,direct` 只有在「墙外域名全被黑名单覆盖」时才成立，实际总会漏——
   漏掉的站点解析出真实 IP 直连，表现为能打开但出口 IP 还是运营商地址，或者干脆打不开。
+- **一定要加 `DOMAIN-SUFFIX,cn,direct`**。远程 cn 表约 11 万条，但不可能覆盖所有国内站：
+  `ip.cn`、`www.qualcomm.cn` 都不在表里，`FINAL,proxy` 会把它们判成墙外域名送进网关，
+  在查 IP 的站点上就显示成国外地址。`.cn` 顶层后缀兜底一次解决这类问题；
+  个别需要走代理的 `.cn` 域名，在它上面单写一条 `proxy` 即可（first-match）。
 - 本地规则永远排在远程规则前面：你手写的判断优先于自动下载的表。
 - `IP-CIDR` / `GEOIP` / `RULE-SET` 会被跳过并在日志点名——本网关在 DNS 层只按域名决策。
 - 改完不用重启：Bot 里点「更新规则」，或 `systemctl reload dotmux`。
@@ -242,7 +247,7 @@ FINAL,proxy
 | 页面 | 内容 |
 |---|---|
 | 📊 状态 | DoT / SNI / QUIC 健康、iOS 描述文件、Bot 自身；当前出口、域名、分流开关、规则数、FINAL；运行时长、CPU 与 load、内存 / Swap、证书剩余天数 |
-| 🌐 出口管理 | 当前出口与出口 IP（含建连 / TLS / 合计三段耗时，测的是本机经该出口到 api.ipify.org，不是手机到本机的延迟）；点名字切换默认出口；添加（`名字 socks5://…` 或直接粘 `名字 ss://…` / `vmess://…` 等分享链接）、重命名（规则里的引用一起改）、删除、并发探测所有出口 |
+| 🌐 出口管理 | 当前出口与出口 IP（含建连 / TLS / 合计三段耗时，测的是本机经该出口到 `1.1.1.1` 边缘节点的往返，不是手机到本机的延迟）；点名字切换默认出口；添加（`名字 socks5://…` 或直接粘 `名字 ss://…` / `vmess://…` 等分享链接）、重命名（规则里的引用一起改）、删除、并发探测所有出口 |
 | 📋 分流管理 | 规则列表、规则集列表、规则设置；添加 / 删除本地规则；添加远程规则集（先选格式：自动 / clash / gfwlist / 纯域名 / dnsmasq，再选动作：走代理 / 直接连）；分类→出口映射；立即更新规则；一键开关分流 |
 | 🛠 系统管理 | 改域名（证书路径同步改）、改国际 / 国内 DNS、续期证书（certbot，异步回执）、重启服务、看最近日志 |
 | 📱 iOS 二维码 | 把 `profile_url` 生成二维码，手机扫码即装 |

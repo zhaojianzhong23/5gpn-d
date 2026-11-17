@@ -189,7 +189,7 @@ func (b *tgBot) renderStatus() (string, *tgKeyboard) {
 
 // probeTiming 把一次探测的耗时拆开呈现。
 //
-// 这三个数全是「本机 → 出口 → api.ipify.org」的往返：建连含 socks5 握手，
+// 这三个数全是「本机 → 出口 → 边缘节点」的往返：建连含 socks5 握手，
 // TLS 是握手本身，合计还含一次 HTTP 请求和读回包。跟手机到本机的内网
 // 延迟是两回事（那一段只有手机自己 ping 才测得到），所以要在界面上写清楚。
 func probeTiming(r ProbeResult) string {
@@ -427,7 +427,9 @@ func (b *tgBot) renderRuleSettings() (string, *tgKeyboard) {
 		"所有规则都没命中时按它处理。\n"+
 		"FINAL,proxy 表示没命中的一律走默认出口（推荐，配合 cn 直连表用：国内直连、其余走网关）；\n"+
 		"FINAL,direct 表示默认直连，只有命中 proxy 规则的域名才走代理——\n"+
-		"墙外黑名单漏掉的站点会解析出真实 IP 直连，表现为打不开或出口 IP 还是运营商地址。", desc)
+		"墙外黑名单漏掉的站点会解析出真实 IP 直连，表现为打不开或出口 IP 还是运营商地址。\n\n"+
+		"建议再加一条 DOMAIN-SUFFIX,cn,direct：cn 表约 11 万条，覆盖不到全部国内站\n"+
+		"（ip.cn、qualcomm.cn 就不在表里），漏掉的会被当成墙外域名送进网关。", desc)
 
 	return text, &tgKeyboard{InlineKeyboard: [][]tgButton{
 		{{Text: "FINAL, direct", CallbackData: "r:final:direct"}, {Text: "FINAL, proxy", CallbackData: "r:final:proxy"}},
@@ -475,6 +477,7 @@ func helpText() string {
 		"DOMAIN-SUFFIX,openai.com,proxy\n" +
 		"DOMAIN-SUFFIX,hk.example.com,proxy:香港\n" +
 		"DOMAIN-KEYWORD,ads,block\n" +
+		"DOMAIN-SUFFIX,cn,direct\n" +
 		"FINAL,proxy\n\n" +
 		"改完点「更新规则」或发 SIGHUP，立即生效。"
 }
@@ -525,7 +528,7 @@ func (b *tgBot) onCallback(chatID, msgID int64, data string) {
 		lines, _ := b.probeAll()
 		text, kb := b.renderExits()
 		b.editMessage(chatID, msgID, text+"\n\n探测结果：\n"+strings.Join(lines, "\n")+
-			"\n\n💡 上面的耗时是本机经该出口访问 api.ipify.org 的往返（建连 + TLS + 首包），"+
+			"\n\n💡 上面的耗时是本机经该出口访问 1.1.1.1 的往返（建连 + TLS + 首包），"+
 			"不含手机到本机这一段。要看内网延迟，在手机上 ping 网关 IP 更准。", kb)
 	case strings.HasPrefix(data, "x:use:"):
 		name := strings.TrimPrefix(data, "x:use:")

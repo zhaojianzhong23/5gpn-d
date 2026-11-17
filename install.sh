@@ -550,6 +550,12 @@ DOMAIN-KEYWORD,doubleclick,block
 # 指定出口：proxy:出口名（出口名在 Bot 的「出口管理」里能看到）
 # DOMAIN-SUFFIX,netflix.com,proxy:香港
 
+# .cn 顶层后缀一律直连。远程 cn 表（约 11 万条）覆盖不了所有国内站，
+# 比如 ip.cn、qualcomm.cn 都不在表里，配 FINAL,proxy 后会被判成墙外域名
+# 走网关，表现为「查 IP 显示国外地址」。这条是兜底，命中率 100%。
+# 极个别需要走代理的 .cn 域名，在上面单写一条 proxy 即可（first-match）。
+DOMAIN-SUFFIX,cn,direct
+
 # 兜底走网关：命中上面 cn 直连表的域名直连，其余一律走代理。
 # 反过来配成 FINAL,direct 会漏掉「不在墙外黑名单里」的站点——
 # 它们会解析出真实 IP 直接连，既打不开也查不出问题。
