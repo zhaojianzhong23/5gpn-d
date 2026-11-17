@@ -99,7 +99,10 @@ CLIENT_CIDR="${CLIENT_CIDR:-}"
 SOCKS5="${SOCKS5:-}"
 TG_TOKEN="${TG_TOKEN:-}"
 TG_ADMINS="${TG_ADMINS:-}"
-QUIC_ENABLED="${QUIC_ENABLED:-1}"
+# QUIC 中继默认关：同一客户端从同一个源端口会并发开多条 H3 连接，
+# 单入口按 SNI 只能稳住一条，多开会串流（表现为“第一次能进、刷新就挂”）。
+# 关掉后浏览器对托管域名直接回落 TCP，SNI 通道照常分流。要开就 QUIC_ENABLED=1。
+QUIC_ENABLED="${QUIC_ENABLED:-0}"
 
 # ---------- 安装 or 升级 ----------
 # 不单独提供 upgrade 命令：跑同一个脚本，装过就只查版本、换二进制、重启。

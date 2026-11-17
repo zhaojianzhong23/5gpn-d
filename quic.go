@@ -33,16 +33,28 @@ type quicRelay struct {
 	nets   []*net.IPNet
 	idle   time.Duration
 	port   int
-	sess   sync.Map // client addr -> *quicSession
+	sess   sync.Map // "addr#连接ID" -> *quicSession（一条会话登记多个 ID）
+	lens   sync.Map // 连接 ID 长度 -> struct{}，短头包按长度逐个试
 	closed atomic.Bool
 }
 
+// quicSession 一条 QUIC 连接的上行。
+//
+// 注意：键不能只用客户端地址。手机后面是一个 NAT，浏览器会从同一个本地
+// UDP 端口同时向多个站点开 HTTP/3 连接（GitHub 的响应里就带 alt-svc: h3，
+// 首次访问走 TCP 成功之后，后续请求会全部切到 QUIC）。若按地址建键，
+// 第二条连接会被塞进第一条的上行 socket —— 也就是把 A 站点的包发给 B 站点，
+// 表现就是“第一次能打开，刷新就挂”。所以按连接 ID 分流，一条会话可登记多个 ID：
+// 客户端 Initial 里的 DCID，以及服务端回包里的 SCID（之后客户端拿它当 DCID 用）。
 type quicSession struct {
+	r      *quicRelay
 	client *net.UDPAddr
 	up     udpPeer
 	target string
 	last   atomic.Int64
 	once   sync.Once
+	mu     sync.Mutex
+	keys   map[string]struct{}
 }
 
 // udpPeer 抽象一条已绑定目标的 UDP 上行，直连与 SOCKS5 UDP 关联共用同一套收发逻辑。
@@ -75,8 +87,38 @@ func (p *proxiedUDP) Close() error { return p.s.Close() }
 
 func (s *quicSession) touch() { s.last.Store(time.Now().Unix()) }
 
+// addKey 把这条会话再挂到一个连接 ID 上（同一会话可有多个）。
+func (s *quicSession) addKey(cid []byte) {
+	if len(cid) == 0 {
+		return
+	}
+	k := cidKey(s.client, cid)
+	s.mu.Lock()
+	if _, ok := s.keys[k]; ok || s.keys == nil {
+		s.mu.Unlock()
+		return
+	}
+	s.keys[k] = struct{}{}
+	s.mu.Unlock()
+	s.r.lens.Store(len(cid), struct{}{})
+	s.r.sess.Store(k, s)
+}
+
 func (s *quicSession) close() {
-	s.once.Do(func() { _ = s.up.Close() })
+	s.once.Do(func() {
+		_ = s.up.Close()
+		s.mu.Lock()
+		for k := range s.keys {
+			s.r.sess.Delete(k)
+		}
+		s.keys = nil
+		s.mu.Unlock()
+	})
+}
+
+// cidKey 拼接会话键。带客户端地址前缀，避免不同客户端的连接 ID 撞在一起。
+func cidKey(addr *net.UDPAddr, cid []byte) string {
+	return addr.String() + "#" + string(cid)
 }
 
 func startQUIC(cfg *Config, rules func() *RuleSet, dyn *Dyn) error {
@@ -119,11 +161,10 @@ func (r *quicRelay) run() {
 		pkt := make([]byte, n)
 		copy(pkt, buf[:n])
 
-		if v, ok := r.sess.Load(addr.String()); ok {
-			s := v.(*quicSession)
+		if v, ok := r.lookup(addr, pkt); ok {
+			s := v
 			s.touch()
 			if err := s.up.Write(pkt); err != nil {
-				r.sess.Delete(addr.String())
 				s.close()
 			}
 			continue
@@ -132,14 +173,113 @@ func (r *quicRelay) run() {
 	}
 }
 
+// lookup 按连接 ID 找到报文所属会话。
+//
+// QUIC 的连接 ID 由两端各自挑选，握手中途会换成 NEW_CONNECTION_ID 里发的新 ID
+// （在加密帧里，中间人看不见）。所以精确分流只在部分实现上奏效；兜底规则是
+// “该客户端只有一条会话时才认领”，有第二条就绝不猜 —— 猜错等于把 A 站点的
+// 报文发给 B 站点，那正是“第一次能打开、刷新就挂”的成因。
+func (r *quicRelay) lookup(addr *net.UDPAddr, pkt []byte) (*quicSession, bool) {
+	if cid := dcidOf(pkt); cid != nil {
+		if v, ok := r.sess.Load(cidKey(addr, cid)); ok {
+			return v.(*quicSession), true
+		}
+	}
+	// 短头包（1-RTT）的目标连接 ID 长度由对端决定，包里没有长度字段。
+	// 已知长度只有少数几种，逐个长度取前缀去比。
+	if len(pkt) > 1 {
+		hit := false
+		var got *quicSession
+		r.lens.Range(func(k, _ any) bool {
+			n := k.(int)
+			if len(pkt) < 1+n {
+				return true
+			}
+			if v, ok := r.sess.Load(cidKey(addr, pkt[1:1+n])); ok {
+				got, hit = v.(*quicSession), true
+				return false
+			}
+			return true
+		})
+		if hit {
+			return got, true
+		}
+	}
+	if isInitialPkt(pkt) {
+		return nil, false // 新连接交给 handleNew，绝不兜底到别的会话
+	}
+	if s := r.sole(addr); s != nil {
+		return s, true
+	}
+	return nil, false
+}
+
+// isInitialPkt 快速判断是不是 QUIC v1 Initial（长头 + 类型 0）。Initial 一定代表
+// 一条新连接，不能拿“该客户端唯一会话”去兜底，否则第二条连接会被塞给第一条目标。
+func isInitialPkt(pkt []byte) bool {
+	return len(pkt) > 6 && pkt[0]&0x80 != 0 && pkt[0]&0x30 == 0 && binary.BigEndian.Uint32(pkt[1:5]) == 1
+}
+
+// sole 返回该客户端唯一的一条会话；有多条时不猜，返回 nil。
+func (r *quicRelay) sole(addr *net.UDPAddr) *quicSession {
+	key := addr.String()
+	var got *quicSession
+	n := 0
+	r.sess.Range(func(_, v any) bool {
+		s := v.(*quicSession)
+		if s.client.String() != key {
+			return true
+		}
+		if got != s {
+			got = s
+			n++
+		}
+		return n < 2
+	})
+	if n == 1 {
+		return got
+	}
+	return nil
+}
+
+// dcidOf 取长头报文里的目标连接 ID（第 6 字节起，长度字段已知）；短头返回 nil。
+func dcidOf(pkt []byte) []byte {
+	if len(pkt) < 7 || pkt[0]&0x80 == 0 {
+		return nil
+	}
+	n := int(pkt[5])
+	if n < 1 || n > 20 || 6+n > len(pkt) {
+		return nil
+	}
+	return pkt[6 : 6+n]
+}
+
+// scidOf 取长头报文里的源连接 ID。服务端回包的 SCID 就是客户端之后用的 DCID。
+func scidOf(pkt []byte) []byte {
+	if len(pkt) < 7 || pkt[0]&0x80 == 0 {
+		return nil
+	}
+	p := 6 + int(pkt[5])
+	if p >= len(pkt) {
+		return nil
+	}
+	n := int(pkt[p])
+	p++
+	if n < 1 || n > 20 || p+n > len(pkt) {
+		return nil
+	}
+	return pkt[p : p+n]
+}
+
 func (r *quicRelay) handleNew(addr *net.UDPAddr, pkt []byte) {
-	host, err := parseQUICInitial(pkt)
+	ini, err := parseInitial(pkt)
 	if err != nil {
 		if err != errNotInitial {
 			logf("debug", "QUIC 解析失败 %s: %v", addr, err)
 		}
 		return
 	}
+	host := ini.host
 	if !inNets(addr.IP, r.nets) {
 		return // 非托管来源不接管
 	}
@@ -169,15 +309,11 @@ func (r *quicRelay) handleNew(addr *net.UDPAddr, pkt []byte) {
 		return
 	}
 
-	s := &quicSession{client: addr, up: up, target: host}
+	s := &quicSession{r: r, client: addr, up: up, target: host, keys: map[string]struct{}{}}
 	s.touch()
-	if _, loaded := r.sess.LoadOrStore(addr.String(), s); loaded {
-		s.close()
-		return
-	}
+	s.addKey(ini.dcid)
 	go r.pumpBack(s)
 	if err := s.up.Write(pkt); err != nil {
-		r.sess.Delete(addr.String())
 		s.close()
 	}
 }
@@ -212,11 +348,14 @@ func (r *quicRelay) pumpBack(s *quicSession) {
 	for {
 		n, err := s.up.Read(buf)
 		if err != nil {
-			r.sess.Delete(s.client.String())
 			s.close()
 			return
 		}
 		s.touch()
+		// 服务端回包的 SCID，就是客户端之后所有报文要用的 DCID。记下来才能分流。
+		if cid := scidOf(buf[:n]); cid != nil {
+			s.addKey(cid)
+		}
 		if _, err := r.conn.WriteToUDP(buf[:n], s.client); err != nil {
 			return
 		}
@@ -229,57 +368,75 @@ func (r *quicRelay) gc() {
 	for range t.C {
 		now := time.Now().Unix()
 		limit := int64(r.idle.Seconds())
-		r.sess.Range(func(k, v any) bool {
+		r.sess.Range(func(_, v any) bool {
 			s := v.(*quicSession)
 			if now-s.last.Load() > limit {
-				r.sess.Delete(k)
-				s.close()
+				s.close() // 连带清掉该会话登记的全部连接 ID
 			}
 			return true
 		})
 	}
 }
 
-// parseQUICInitial 解密 QUIC v1 Initial 包，从 CRYPTO 帧里取出 TLS ClientHello 的 SNI。
+type quicInitial struct {
+	host string
+	dcid []byte
+}
+
+// parseInitial 解密 QUIC v1 Initial 包，取出 SNI 与目标连接 ID。
+func parseInitial(pkt []byte) (*quicInitial, error) {
+	host, dcid, err := parseInitialParts(pkt)
+	if err != nil {
+		return nil, err
+	}
+	return &quicInitial{host: host, dcid: dcid}, nil
+}
+
+// parseQUICInitial 只关心 SNI 的调用方用这个。
 func parseQUICInitial(pkt []byte) (string, error) {
+	host, _, err := parseInitialParts(pkt)
+	return host, err
+}
+
+func parseInitialParts(pkt []byte) (string, []byte, error) {
 	if len(pkt) < 40 || pkt[0]&0x80 == 0 {
-		return "", errNotInitial
+		return "", nil, errNotInitial
 	}
 	if binary.BigEndian.Uint32(pkt[1:5]) != 1 {
-		return "", errNotInitial
+		return "", nil, errNotInitial
 	}
 	// v1: 0x00 = Initial（低 4 位含 PN 长度，先不看）
 	if pkt[0]&0x30 != 0x00 {
-		return "", errNotInitial
+		return "", nil, errNotInitial
 	}
 	p := 5
 	dcidLen := int(pkt[p])
 	p++
 	if dcidLen < 1 || dcidLen > 20 || p+dcidLen > len(pkt) {
-		return "", errNotInitial
+		return "", nil, errNotInitial
 	}
 	dcid := pkt[p : p+dcidLen]
 	p += dcidLen
 	scidLen := int(pkt[p])
 	p++
 	if p+scidLen > len(pkt) {
-		return "", errNotInitial
+		return "", nil, errNotInitial
 	}
 	p += scidLen
 
 	tokenLen, n := readVarint(pkt[p:])
 	if n == 0 {
-		return "", errNotInitial
+		return "", nil, errNotInitial
 	}
 	p += n
 	if tokenLen > uint64(len(pkt)) || p+int(tokenLen) > len(pkt) {
-		return "", errNotInitial
+		return "", nil, errNotInitial
 	}
 	p += int(tokenLen)
 
 	length, n := readVarint(pkt[p:])
 	if n == 0 {
-		return "", errNotInitial
+		return "", nil, errNotInitial
 	}
 	p += n
 	end := p + int(length)
@@ -287,22 +444,22 @@ func parseQUICInitial(pkt []byte) (string, error) {
 		end = len(pkt)
 	}
 	if p+4+16 > end {
-		return "", errors.New("Initial 负载过短")
+		return "", nil, errors.New("Initial 负载过短")
 	}
 
 	plain, err := decryptInitial(dcid, pkt, p, end)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	hello, err := extractCryptoFrame(plain)
 	if err != nil {
-		return "", err
+		return "", nil, err
 	}
 	host, err := parseClientHello(hello)
 	if err != nil {
-		return "", fmt.Errorf("%w: %v", errNoSNI, err)
+		return "", nil, fmt.Errorf("%w: %v", errNoSNI, err)
 	}
-	return host, nil
+	return host, dcid, nil
 }
 
 func decryptInitial(dcid, pkt []byte, pnOffset, end int) ([]byte, error) {
