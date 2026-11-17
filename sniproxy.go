@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -35,7 +36,10 @@ type snipSvc struct {
 
 // maxInflight 限制同时处理的连接数。fd 是共享资源，一旦被打满，
 // 连 DoT 的解析请求都分配不到 socket，表现就是「所有网站都挂了」。
-// 每个连接占 2 个 fd，4096 条远小于 65535 的上限，留足余量。
+//
+// 这个值不能调小：公网扫描器能轻松打到几千并发，上限一低，被丢掉的
+// 就是自己手机的连接（日志里「并发连接已达上限」每次都是这个含义）。
+// 真正的解法是不给非托管来源进来的机会，而不是把闸门压低。
 const maxInflight = 4096
 
 // selfAddrs 保存本机所有 IPv4 地址。转发前先比对一下：
@@ -543,14 +547,14 @@ func parseHostHeader(b []byte) (string, error) {
 func pump(br *bufio.Reader, upstream net.Conn, client net.Conn) {
 	done := make(chan struct{}, 2)
 	go func() {
-		_, _ = io.Copy(upstream, br)
+		copyFlow(upstream, br)
 		if tc, ok := upstream.(*net.TCPConn); ok {
 			_ = tc.CloseWrite()
 		}
 		done <- struct{}{}
 	}()
 	go func() {
-		_, _ = io.Copy(client, upstream)
+		copyFlow(client, upstream)
 		if tc, ok := client.(*net.TCPConn); ok {
 			_ = tc.CloseWrite()
 		}
@@ -558,6 +562,43 @@ func pump(br *bufio.Reader, upstream net.Conn, client net.Conn) {
 	}()
 	<-done
 	<-done
+}
+
+// copyBufPool 复用中转缓冲，避免每条连接各分配一次。
+// 单向 16KB，几十条并发时内存占用可以忽略。
+var copyBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 16*1024)
+		return &b
+	},
+}
+
+// copyFlow 在两条连接之间搬字节。
+//
+// 这里刻意不用 io.Copy：目标是 *net.TCPConn 时它会走 ReadFrom -> splice(2)
+// 的零拷贝路径，每次都要从内部池里取一对 pipe fd 当内核中转缓冲。并发冲高
+// 时这些管道会成对地留在进程里不归还——线上见过一个只剩 13 条 socket 的
+// 进程占着 8210 个 pipe fd，正好是 4096 个并发连接的两倍，跟 inflight 上限
+// 撞在同一个数字上。fd 被这批死管道占住之后，DoT 的解析和 443 的转发会一起
+// 分不到 socket，表现就是「偶尔打不开、重试又好了」。
+//
+// 换成固定缓冲自己搬，全程只占两条 socket。代价是丢掉零拷贝，但这条链路是
+// 单设备手机接入，几 MB/s 的流量用不出任何区别。
+func copyFlow(dst net.Conn, src io.Reader) {
+	bp := copyBufPool.Get().(*[]byte)
+	defer copyBufPool.Put(bp)
+	b := *bp
+	for {
+		n, err := src.Read(b)
+		if n > 0 {
+			if _, werr := dst.Write(b[:n]); werr != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
+		}
+	}
 }
 
 // isSelfHost 判断 host 是否指向本机：IP 字面量命中本机地址，或就是配置里的域名。
