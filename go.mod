@@ -1,4 +1,4 @@
-module github.com/zhaojianzhong23/dotmux
+module github.com/zhaojianzhong23/5gpn-d
 
 go 1.21
 

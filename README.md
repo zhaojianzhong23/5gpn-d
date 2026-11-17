@@ -41,7 +41,7 @@ iPhone/Android ── DoT :853 ──► dotmux ──► 国内域名：返回�
 ## 安装
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/zhaojianzhong23/dotmux/main/install.sh -o install.sh
+curl -fsSL https://raw.githubusercontent.com/zhaojianzhong23/5gpn-d/main/install.sh -o install.sh
 sudo bash install.sh
 ```
 
@@ -50,7 +50,7 @@ sudo bash install.sh
 或先看代码：
 
 ```bash
-git clone https://github.com/zhaojianzhong23/dotmux.git && cd dotmux
+git clone https://github.com/zhaojianzhong23/5gpn-d.git && cd 5gpn-d
 go build -o dotmux .
 sudo DOMAIN=dot.example.com EMAIL=you@example.com CLIENT_CIDR=172.22.0.0/16 \
      SOCKS5=user:pass@1.2.3.4:1080 \

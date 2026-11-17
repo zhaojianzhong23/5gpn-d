@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const httpUA = "dotmux/0.2 (+https://github.com/zhaojianzhong23/dotmux)"
+const httpUA = "dotmux/0.2 (+https://github.com/zhaojianzhong23/5gpn-d)"
 
 // LoadMergedRules 先读本地规则（用户手写，优先级最高），再追加远程规则源，
 // 最后以本地文件的 FINAL 兜底。远程源失败不影响已加载的规则。

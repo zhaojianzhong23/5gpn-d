@@ -2,7 +2,7 @@
 # dotmux 安装脚本：Debian 12+ / Ubuntu 22.04+
 set -euo pipefail
 
-REPO="${REPO:-zhaojianzhong23/dotmux}"
+REPO="${REPO:-zhaojianzhong23/5gpn-d}"
 BIN=/usr/local/bin/dotmux
 CONF_DIR=/etc/dotmux
 CONF="$CONF_DIR/config.json"
