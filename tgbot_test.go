@@ -271,8 +271,9 @@ func TestRuleSetFlow(t *testing.T) {
 
 	b.onCallback(1001, 7, "r:addset")
 	b.onCallback(1001, 7, "r:addset:auto")
+	b.onCallback(1001, 7, "r:addact:auto:proxy")
 	if b.getSess(1001) == nil {
-		t.Fatal("点了格式按钮后应进入等待输入状态")
+		t.Fatal("选了格式和动作后应进入等待输入状态")
 	}
 	b.onInput(1001, b.getSess(1001), srv.URL+"/list myset")
 	if len(b.deps.Dyn.Sources()) != 1 {
@@ -415,5 +416,71 @@ func TestParseDNSList(t *testing.T) {
 	}
 	if _, err := parseDNSList("abc"); err == nil {
 		t.Fatal("非法输入应报错")
+	}
+}
+
+// 国内直连表被当成「走代理」是这次线上故障的根因：所有国内域名被解析到
+// 本机，再从 VPS 出海回访国内站，表现为「Telegram 能用、网页全打不开」，
+// 而 Bot 页面上一切正常。所以动作必须由用户显式选，且要真的落到配置里。
+func TestRuleSetActionChoice(t *testing.T) {
+	b, _, _ := newTestBot(t, tgDeps{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("server=/baidu.com/114.114.114.114\nserver=/qq.com/119.29.29.29\n"))
+	}))
+	defer srv.Close()
+
+	b.onCallback(1001, 7, "r:addset")
+	b.onCallback(1001, 7, "r:addset:dnsmasq")
+	if b.getSess(1001) != nil {
+		t.Fatal("选完格式应停在动作选择，不能直接进入输入")
+	}
+	b.onCallback(1001, 7, "r:addact:dnsmasq:direct")
+	if b.getSess(1001) == nil {
+		t.Fatal("选完动作应进入等待输入")
+	}
+	b.onInput(1001, b.getSess(1001), srv.URL+"/accelerated-domains.china.conf cn")
+
+	srcs := b.deps.Dyn.Sources()
+	if len(srcs) != 1 {
+		t.Fatalf("规则集没加上: %+v", srcs)
+	}
+	if srcs[0].Action != "direct" {
+		t.Fatalf("动作 = %q，应为 direct（这就是国内表被当成走代理的那个 bug）", srcs[0].Action)
+	}
+	if srcs[0].Format != "dnsmasq" {
+		t.Fatalf("格式 = %q，应为 dnsmasq", srcs[0].Format)
+	}
+}
+
+// 动作只认 proxy / direct，别的一律打回，避免回调被手改成 proxy:xxx 之类。
+func TestRuleSetActionRejectsUnknown(t *testing.T) {
+	b, _, _ := newTestBot(t, tgDeps{})
+	b.onCallback(1001, 7, "r:addset")
+	b.onCallback(1001, 7, "r:addact:auto:block")
+	if b.getSess(1001) != nil {
+		t.Fatal("非法动作不应进入输入状态")
+	}
+}
+
+// 老会话（arg 里只有格式，没有 |动作）按老行为走代理，不能崩、不能空动作。
+func TestRuleSetLegacySessArg(t *testing.T) {
+	b, _, _ := newTestBot(t, tgDeps{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte("a.test\nb.test\n"))
+	}))
+	defer srv.Close()
+
+	b.setSess(1001, &tgsess{kind: "add_set", arg: "auto", msgID: 7})
+	b.onInput(1001, b.getSess(1001), srv.URL+"/list legacy")
+
+	srcs := b.deps.Dyn.Sources()
+	if len(srcs) != 1 {
+		t.Fatalf("规则集没加上: %+v", srcs)
+	}
+	if srcs[0].Action != "proxy" {
+		t.Fatalf("老会话动作 = %q，应为 proxy", srcs[0].Action)
+	}
+	if srcs[0].Format != "auto" {
+		t.Fatalf("老会话格式 = %q，应为 auto", srcs[0].Format)
 	}
 }
