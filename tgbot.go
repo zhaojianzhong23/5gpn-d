@@ -131,6 +131,13 @@ func (b *tgBot) loop() {
 	for {
 		ups, err := b.getUpdates()
 		if err != nil {
+			// 同一个 token 被两处 getUpdates 时会返回 Conflict。
+			// 这种情况退避一两秒没用，直接等一分钟，并把话说清楚。
+			if strings.Contains(err.Error(), "Conflict") {
+				logf("error", "Telegram 轮询冲突：同一 token 有另一个实例在跑（本机重复启动或另一台机器共用 Bot），60 秒后重试")
+				time.Sleep(60 * time.Second)
+				continue
+			}
 			logf("warn", "Telegram 轮询失败: %v", err)
 			time.Sleep(backoff)
 			if backoff < 30*time.Second {
