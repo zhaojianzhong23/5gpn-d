@@ -61,6 +61,20 @@
         "format": "domain",
         "prefix": "DOMAIN-SUFFIX",
         "action": "proxy"
+      },
+      {
+        "name": "proxy",
+        "url": "https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/proxy.txt",
+        "format": "domain",
+        "prefix": "DOMAIN-SUFFIX",
+        "action": "proxy"
+      },
+      {
+        "name": "cn",
+        "url": "https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/direct.txt",
+        "format": "domain",
+        "prefix": "DOMAIN-SUFFIX",
+        "action": "direct"
       }
     ]
   },

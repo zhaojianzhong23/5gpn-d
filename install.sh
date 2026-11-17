@@ -502,6 +502,20 @@ else
         "format": "domain",
         "prefix": "DOMAIN-SUFFIX",
         "action": "proxy"
+      },
+      {
+        "name": "proxy",
+        "url": "https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/proxy.txt",
+        "format": "domain",
+        "prefix": "DOMAIN-SUFFIX",
+        "action": "proxy"
+      },
+      {
+        "name": "cn",
+        "url": "https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/direct.txt",
+        "format": "domain",
+        "prefix": "DOMAIN-SUFFIX",
+        "action": "direct"
       }
     ]
   },
@@ -536,7 +550,10 @@ DOMAIN-KEYWORD,doubleclick,block
 # 指定出口：proxy:出口名（出口名在 Bot 的「出口管理」里能看到）
 # DOMAIN-SUFFIX,netflix.com,proxy:香港
 
-FINAL,direct
+# 兜底走网关：命中上面 cn 直连表的域名直连，其余一律走代理。
+# 反过来配成 FINAL,direct 会漏掉「不在墙外黑名单里」的站点——
+# 它们会解析出真实 IP 直接连，既打不开也查不出问题。
+FINAL,proxy
 EOF
     ok "已写入示例规则 $RULES（按需修改）"
 fi

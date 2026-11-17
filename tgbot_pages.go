@@ -425,8 +425,9 @@ func (b *tgBot) renderRuleSettings() (string, *tgKeyboard) {
 	}
 	text := fmt.Sprintf("⚙️ 规则设置\n\n兜底动作 FINAL：%s\n\n"+
 		"所有规则都没命中时按它处理。\n"+
-		"FINAL,direct 表示默认直连，只有命中 proxy 规则的域名才走代理；\n"+
-		"FINAL,proxy 表示默认全走默认出口。", desc)
+		"FINAL,proxy 表示没命中的一律走默认出口（推荐，配合 cn 直连表用：国内直连、其余走网关）；\n"+
+		"FINAL,direct 表示默认直连，只有命中 proxy 规则的域名才走代理——\n"+
+		"墙外黑名单漏掉的站点会解析出真实 IP 直连，表现为打不开或出口 IP 还是运营商地址。", desc)
 
 	return text, &tgKeyboard{InlineKeyboard: [][]tgButton{
 		{{Text: "FINAL, direct", CallbackData: "r:final:direct"}, {Text: "FINAL, proxy", CallbackData: "r:final:proxy"}},
@@ -474,7 +475,7 @@ func helpText() string {
 		"DOMAIN-SUFFIX,openai.com,proxy\n" +
 		"DOMAIN-SUFFIX,hk.example.com,proxy:香港\n" +
 		"DOMAIN-KEYWORD,ads,block\n" +
-		"FINAL,direct\n\n" +
+		"FINAL,proxy\n\n" +
 		"改完点「更新规则」或发 SIGHUP，立即生效。"
 }
 

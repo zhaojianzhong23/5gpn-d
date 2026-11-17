@@ -169,10 +169,13 @@ DOMAIN,exact.example.com,direct
 DOMAIN-SUFFIX,openai.com,proxy
 DOMAIN-SUFFIX,netflix.com,proxy:香港
 DOMAIN-KEYWORD,doubleclick,block
-FINAL,direct
+FINAL,proxy
 ```
 
 - `proxy` = 走默认出口；`proxy:香港` = 走指定出口；`direct` = 本地直出；`block` = NXDOMAIN。
+- **`FINAL` 建议配成 `proxy`，配合国内直连表使用**：命中国内表 → 直连，其余一律走网关。
+  配成 `FINAL,direct` 只有在「墙外域名全被黑名单覆盖」时才成立，实际总会漏——
+  漏掉的站点解析出真实 IP 直连，表现为能打开但出口 IP 还是运营商地址，或者干脆打不开。
 - 本地规则永远排在远程规则前面：你手写的判断优先于自动下载的表。
 - `IP-CIDR` / `GEOIP` / `RULE-SET` 会被跳过并在日志点名——本网关在 DNS 层只按域名决策。
 - 改完不用重启：Bot 里点「更新规则」，或 `systemctl reload dotmux`。
@@ -208,10 +211,19 @@ FINAL,direct
 - 十万条规则下单次查询约 **56 ns**（benchmark 实测），不会成为 DNS 瓶颈；
 - 启动**只读缓存不联网**，网络慢/挂掉也能秒起；后台再拉，拉完通知 Bot。
 
-默认只配了 `gfw.txt` 一个源。国内列表（`china-list.txt`，十万条直连）只在把 `FINAL` 改成 `proxy` 时才有意义——`FINAL,direct` 时未命中的域名本来就直连。
+默认配了三个源，走的是「国内直连 + 其余全代理」的白名单模型：
+
+| 源 | 动作 | 作用 |
+|---|---|---|
+| `gfw`（`gfw.txt`） | proxy | 墙外黑名单 |
+| `proxy`（`proxy.txt`） | proxy | 常见需要代理的站点 |
+| `cn`（`direct.txt`，十万条） | direct | 国内域名直连 |
+
+配合 `rules.conf` 的 `FINAL,proxy`：命中 `cn` 直连，其余全部走网关。远程源按数组顺序追加，
+同名规则先到先得，所以 `cn` 放最后——和代理表重叠的域名仍按代理走。
 
 ```jsonc
-{ "name": "china", "url": "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/china-list.txt",
+{ "name": "cn", "url": "https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/direct.txt",
   "format": "domain", "prefix": "DOMAIN-SUFFIX", "action": "direct" }
 ```
 
