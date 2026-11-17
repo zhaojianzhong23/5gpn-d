@@ -591,18 +591,41 @@ func (b *tgBot) onCallback(chatID, msgID int64, data string) {
 		}})
 	case strings.HasPrefix(data, "r:addset:"):
 		fmtName := strings.TrimPrefix(data, "r:addset:")
-		hint := map[string]string{
-			"auto":    "按内容判断：base64 走 gfwlist，含 server=/ 走 dnsmasq，含 DOMAIN- 走 clash，其余按纯域名。",
-			"clash":   "每行形如 `- DOMAIN-SUFFIX,example.com`，规则类型取行内自带的。",
-			"gfwlist": "base64 编码的 gfwlist，或 adblock 语法（`||example.com^`）。",
-			"domain":  "一行一个域名，统一按 DOMAIN-SUFFIX 匹配。",
-			"dnsmasq": "形如 `server=/baidu.com/114.114.114.114`，国内直连表常用这种（dnsmasq-china-list）。",
-		}[fmtName]
-		b.askInput(chatID, msgID, "add_set", fmtName,
-			"➕ 添加规则集（格式 "+fmtName+"）\n\n"+hint+"\n\n"+
+		// 格式定了还要定动作。这一步不能省：国内直连表被当成「走代理」的话，
+		// 国内域名会被解析成本机 IP、从 VPS 出海再回访国内站，现象就是
+		// 「Telegram 能用，网页全打不开」，而页面上一切正常，极难自查。
+		kb := [][]tgButton{
+			{{Text: "🌐 走代理（被墙/国外站）", CallbackData: "r:addact:" + fmtName + ":proxy"}},
+			{{Text: "📱 直接连（国内域名）", CallbackData: "r:addact:" + fmtName + ":direct"}},
+			{{Text: "« 返回选格式", CallbackData: "r:addset"}},
+		}
+		if fmtName == "dnsmasq" {
+			// dnsmasq-china-list 这类表几乎都是国内直连，把 direct 放前面。
+			kb = [][]tgButton{
+				{{Text: "📱 直接连（推荐）", CallbackData: "r:addact:" + fmtName + ":direct"}},
+				{{Text: "🌐 走代理", CallbackData: "r:addact:" + fmtName + ":proxy"}},
+				{{Text: "« 返回选格式", CallbackData: "r:addset"}},
+			}
+		}
+		b.editMessage(chatID, msgID, "➕ 添加规则集（格式 "+fmtName+"）\n\n"+
+			"再选它命中后怎么走：\n\n"+
+			"🌐 走代理 —— 被墙/国外站点列表（gfw、clash 的 proxy.txt）\n"+
+			"📱 直接连 —— 国内域名列表（dnsmasq-china-list 之类）\n\n"+
+			"⚠️ 这一项选错最难发现：国内表选成走代理，会把国内域名解析到本机、"+
+			"再从 VPS 出海回访国内站，表现就是「Telegram 能用，网页全打不开」。",
+			&tgKeyboard{InlineKeyboard: kb})
+	case strings.HasPrefix(data, "r:addact:"):
+		parts := strings.SplitN(strings.TrimPrefix(data, "r:addact:"), ":", 2)
+		if len(parts) != 2 || (parts[1] != "proxy" && parts[1] != "direct") {
+			b.editMessage(chatID, msgID, "❌ 参数不对，重新点一次「➕ 添加规则集」。", backOnly())
+			return
+		}
+		fmtName, act := parts[0], parts[1]
+		b.askInput(chatID, msgID, "add_set", fmtName+"|"+act,
+			"➕ 添加规则集（格式 "+fmtName+"，动作 "+actionLabel(act)+"）\n\n"+
 				"发一条消息：\n<URL> [名字]\n\n"+
-				"例：\nhttps://example.com/proxy.txt proxy\n\n"+
-				"不写名字会自动命名；动作 proxy（走默认出口）。\n发 /cancel 取消。")
+				"例：\nhttps://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/accelerated-domains.china.conf cn\n\n"+
+				"不写名字会自动命名；动作已定为「"+actionLabel(act)+"」，想改就重新点一次。\n发 /cancel 取消。")
 	case data == "r:up":
 		b.editMessage(chatID, msgID, "🔄 正在拉取规则…", nil)
 		rs, err := b.deps.Refresh()
@@ -732,6 +755,20 @@ func displayTarget(name string) string {
 	return name
 }
 
+// actionLabel 把规则集动作翻译成人话，回执和提示里都用它。
+func actionLabel(action string) string {
+	switch {
+	case action == "direct":
+		return "直接连"
+	case action == "block":
+		return "拒绝"
+	case strings.HasPrefix(action, "proxy:"):
+		return "走代理 → " + strings.TrimPrefix(action, "proxy:")
+	default:
+		return "走代理"
+	}
+}
+
 // askInput 进入等待输入状态。
 func (b *tgBot) askInput(chatID, msgID int64, kind, arg, prompt string) {
 	b.setSess(chatID, &tgsess{kind: kind, arg: arg, msgID: msgID})
@@ -853,16 +890,24 @@ func (b *tgBot) onInput(chatID int64, s *tgsess, text string) {
 		if name == "" {
 			name = "set" + strconv.Itoa(len(b.deps.Dyn.Sources())+1)
 		}
-		fmtName := s.arg
-		if fmtName == "" {
-			fmtName = "auto"
+		fmtName, act := "auto", "proxy"
+		if a := s.arg; a != "" {
+			if i := strings.LastIndex(a, "|"); i > 0 {
+				fmtName, act = a[:i], a[i+1:]
+			} else {
+				// 老会话里只存了格式，按老行为走代理
+				fmtName = a
+			}
+		}
+		if act != "direct" && act != "proxy" {
+			act = "proxy"
 		}
 		before := 0
 		if cur := b.deps.Rules(); cur != nil {
 			before = cur.Count()
 		}
 		src := RemoteSource{
-			Name: name, URL: u, Format: fmtName, Prefix: "DOMAIN-SUFFIX", Action: "proxy",
+			Name: name, URL: u, Format: fmtName, Prefix: "DOMAIN-SUFFIX", Action: act,
 		}
 		if err := b.deps.Dyn.AddSource(src); err != nil {
 			b.sendMessage(chatID, "❌ "+err.Error(), nil)
@@ -883,10 +928,8 @@ func (b *tgBot) onInput(chatID int64, s *tgsess, text string) {
 				[]tgButton{{Text: "📚 规则集", CallbackData: "r:set"}}))
 			return
 		}
-		b.sendMessage(chatID, fmt.Sprintf("✅ 规则集 %s 已添加（选的 %s），解析出 %d 条，规则现共 %d 条\n\n"+
-			"默认动作是走代理。如果这是国内直连表（dnsmasq-china-list 之类），"+
-			"记得点「🎯 分类 → 出口映射」把它改成直连，否则国内站会绕一圈 VPS。",
-			name, fmtName, added, rs.Count()), backOnly(
+		b.sendMessage(chatID, fmt.Sprintf("✅ 规则集 %s 已添加（格式 %s，动作 %s），解析出 %d 条，规则现共 %d 条",
+			name, fmtName, actionLabel(act), added, rs.Count()), backOnly(
 			[]tgButton{{Text: "📚 规则集", CallbackData: "r:set"}}))
 
 	case "set_domain":
