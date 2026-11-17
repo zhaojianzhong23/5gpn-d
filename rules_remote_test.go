@@ -111,3 +111,25 @@ func TestRemoteRuleCacheFallback(t *testing.T) {
 	}
 	srv.Close()
 }
+
+// 选错格式是最容易踩的坑：clash 列表按 domain 解析会得到 0 条。
+// 这里锁住两个行为：解析为空必须报错（而不是静默返回空表让别人以为加上了），
+// 以及 auto 能按内容把格式纠回来。
+func TestWrongFormatFailsLoudly(t *testing.T) {
+	clash := "- DOMAIN-SUFFIX,openai.com\n- DOMAIN-SUFFIX,github.com\n"
+
+	if _, err := parseRemoteBody([]byte(clash), RemoteSource{Format: "domain", Action: "proxy"}); err == nil {
+		t.Fatal("clash 内容按 domain 解析应当报错，不能静默返回空表")
+	}
+
+	rules, err := parseRemoteBody([]byte(clash), RemoteSource{Format: "auto", Action: "proxy"})
+	if err != nil {
+		t.Fatalf("auto 应能识别 clash：%v", err)
+	}
+	if len(rules) != 2 {
+		t.Fatalf("auto 解析出 %d 条，应为 2", len(rules))
+	}
+	if rules[0].Type != "DOMAIN-SUFFIX" || rules[0].Value != "openai.com" {
+		t.Fatalf("首条解析结果 = %+v", rules[0])
+	}
+}

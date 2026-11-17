@@ -270,9 +270,16 @@ func TestRuleSetFlow(t *testing.T) {
 	defer srv.Close()
 
 	b.onCallback(1001, 7, "r:addset")
+	b.onCallback(1001, 7, "r:addset:auto")
+	if b.getSess(1001) == nil {
+		t.Fatal("点了格式按钮后应进入等待输入状态")
+	}
 	b.onInput(1001, b.getSess(1001), srv.URL+"/list myset")
 	if len(b.deps.Dyn.Sources()) != 1 {
 		t.Fatalf("规则集没加上: %+v", b.deps.Dyn.Sources())
+	}
+	if got := b.deps.Dyn.Sources()[0].Format; got != "auto" {
+		t.Fatalf("格式 = %q，应为 auto", got)
 	}
 
 	// 映射到出口
