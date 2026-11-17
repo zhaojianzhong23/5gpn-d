@@ -23,7 +23,7 @@ iPhone/Android ── DoT :853 ──► dotmux ──► 国内域名：返回�
 | TCP 443/80 | 从 ClientHello 读 SNI（HTTP 读 Host），按域名选出口转发 |
 | QUIC UDP/443 | 解密 QUIC v1 Initial 包取 SNI，按规则走 SOCKS5 UDP 关联或直连；会话按连接 ID 维护，空闲回收（默认关，见下） |
 | 多出口 | `exits[]` 可放任意多个出口：`direct`、`socks5`，或直接粘 **ss / vmess / vless / trojan / hysteria2 / tuic / anytls** 分享链接（由内置 mihomo 落地）；规则用 `proxy:名字` 精确指定，默认出口 Bot 里一键切换 |
-| 规则 | 本地文件 + 定时拉取远程规则源（gfwlist / clash / 纯域名），失败回退上次缓存 |
+| 规则 | 本地文件 + 定时拉取远程规则源（clash / domain / gfwlist / dnsmasq），格式猜错自动换着试，失败回退上次缓存 |
 | 控制 | Telegram 面板：状态、出口增删改查与探测、规则与规则集增删、分类映射、DNS/域名/证书、日志、重启 |
 | 边界 | 只接管 `client_cidr` 内的来源，其它来源按真实地址解析，不影响别人 |
 | 热更新 | 规则、出口、DNS、分流开关改完立即生效；证书每次握手重新读文件，certbot 续期后无需重启 |
@@ -179,14 +179,20 @@ FINAL,direct
 
 ### 自动拉取
 
-`rules.remote` 是一个数组，支持三种格式：
+`rules.remote` 是一个数组，支持四种格式：
 
 | format | 适用 |
 |---|---|
 | `domain` | 每行一个域名（Loyalsoldier 的 `gfw.txt` / `china-list.txt`） |
 | `gfwlist` | base64 编码的 adblock 规则（`\|\|example.com^`） |
 | `clash` | `- DOMAIN-SUFFIX,xxx` 形式的列表，保留每条自己的类型 |
+| `dnsmasq` | `server=/baidu.com/114.114.114.114`（felixonmars/dnsmasq-china-list） |
 | `auto` | 按内容猜（默认） |
+
+**格式猜错不会白跑。** 按 `format` 指定的格式解析不出条目时，会依次试其余
+格式，哪种出东西用哪种，日志里写明最终用了哪个（`规则源 proxy: 解析 12803
+条，新增 12803 条（clash）`）。四种都解析不出来才报错，此时基本是 URL 返回
+了 HTML（404 页、登录页）而不是规则列表。
 
 行为细节：
 
@@ -219,7 +225,7 @@ FINAL,direct
 |---|---|
 | 📊 状态 | DoT / SNI / QUIC 健康、iOS 描述文件、Bot 自身；当前出口、域名、分流开关、规则数、FINAL；运行时长、CPU 与 load、内存 / Swap、证书剩余天数 |
 | 🌐 出口管理 | 当前出口与出口 IP（含建连 / TLS / 合计三段耗时，测的是本机经该出口到 api.ipify.org，不是手机到本机的延迟）；点名字切换默认出口；添加（`名字 socks5://…` 或直接粘 `名字 ss://…` / `vmess://…` 等分享链接）、重命名（规则里的引用一起改）、删除、并发探测所有出口 |
-| 📋 分流管理 | 规则列表、规则集列表、规则设置；添加 / 删除本地规则；添加远程规则集（先选格式：自动 / clash / gfwlist / 纯域名）；分类→出口映射；立即更新规则；一键开关分流 |
+| 📋 分流管理 | 规则列表、规则集列表、规则设置；添加 / 删除本地规则；添加远程规则集（先选格式：自动 / clash / gfwlist / 纯域名 / dnsmasq）；分类→出口映射；立即更新规则；一键开关分流 |
 | 🛠 系统管理 | 改域名（证书路径同步改）、改国际 / 国内 DNS、续期证书（certbot，异步回执）、重启服务、看最近日志 |
 | 📱 iOS 二维码 | 把 `profile_url` 生成二维码，手机扫码即装 |
 
@@ -303,7 +309,7 @@ QUIC 测试用 `quic-go` 做客户端验证中继：故意破坏 SNI 解析后�
 | `config.go` | 配置、校验、旧配置迁移 |
 | `dyn.go` | 运行时状态：出口表、默认出口、DNS 池、分流开关、规则源；写回 config.json |
 | `rules.go` | 规则解析、索引构建、`MatchRoute`（动作 + 出口） |
-| `rules_remote.go` | 远程规则拉取、三种格式解析、缓存回退 |
+| `rules_remote.go` | 远程规则拉取、四种格式解析与自动回退、缓存回退 |
 | `rules_edit.go` | 本地规则的增删改（保留原文件其它内容） |
 | `dns.go` | DoT 服务、分流决策、缓存、上游转发 |
 | `sniproxy.go` | ClientHello/Host 解析与 TCP 转发 |

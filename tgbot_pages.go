@@ -575,25 +575,28 @@ func (b *tgBot) onCallback(chatID, msgID int64, data string) {
 				"例：\nopenai.com\nopenai.com 香港\n\n"+
 				"不写出口就走默认出口；默认按 DOMAIN-SUFFIX 匹配（含子域名）。\n发 /cancel 取消。")
 	case data == "r:addset":
-		b.editMessage(chatID, msgID, "➕ 添加规则集\n\n先选列表格式——选错了会解析出 0 条，"+
-			"而页面只会显示「远程规则集 +1」、总数不动，很难看出来。\n\n"+
-			"🤖 自动识别：按内容判断，拿不准就用这个\n"+
+		b.editMessage(chatID, msgID, "➕ 添加规则集\n\n先选列表格式。选不准就选「自动识别」——"+
+			"猜错也不会白跑，会依次试其余格式，日志里写明最终用了哪个。\n\n"+
+			"🤖 自动识别：按内容判断\n"+
 			"📋 clash：每行 `- DOMAIN-SUFFIX,example.com`\n"+
 			"🔒 gfwlist：base64 编码，或 adblock 语法 `||example.com^`\n"+
-			"📄 纯域名：一行一个域名", &tgKeyboard{InlineKeyboard: [][]tgButton{
+			"📄 纯域名：一行一个域名\n"+
+			"🔧 dnsmasq：`server=/baidu.com/114.114.114.114`", &tgKeyboard{InlineKeyboard: [][]tgButton{
 			{{Text: "🤖 自动识别", CallbackData: "r:addset:auto"}},
 			{{Text: "📋 clash 格式", CallbackData: "r:addset:clash"}},
 			{{Text: "🔒 gfwlist 格式", CallbackData: "r:addset:gfwlist"}},
 			{{Text: "📄 纯域名列表", CallbackData: "r:addset:domain"}},
+			{{Text: "🔧 dnsmasq 格式", CallbackData: "r:addset:dnsmasq"}},
 			{{Text: "« 返回", CallbackData: "r"}},
 		}})
 	case strings.HasPrefix(data, "r:addset:"):
 		fmtName := strings.TrimPrefix(data, "r:addset:")
 		hint := map[string]string{
-			"auto":    "按内容判断：含 DOMAIN- 走 clash，base64 走 gfwlist，其余按纯域名。",
+			"auto":    "按内容判断：base64 走 gfwlist，含 server=/ 走 dnsmasq，含 DOMAIN- 走 clash，其余按纯域名。",
 			"clash":   "每行形如 `- DOMAIN-SUFFIX,example.com`，规则类型取行内自带的。",
 			"gfwlist": "base64 编码的 gfwlist，或 adblock 语法（`||example.com^`）。",
 			"domain":  "一行一个域名，统一按 DOMAIN-SUFFIX 匹配。",
+			"dnsmasq": "形如 `server=/baidu.com/114.114.114.114`，国内直连表常用这种（dnsmasq-china-list）。",
 		}[fmtName]
 		b.askInput(chatID, msgID, "add_set", fmtName,
 			"➕ 添加规则集（格式 "+fmtName+"）\n\n"+hint+"\n\n"+
@@ -872,18 +875,17 @@ func (b *tgBot) onInput(chatID int64, s *tgsess, text string) {
 		}
 		added := rs.Count() - before
 		if added <= 0 {
-			// 拉到了但一条也没解析出来，基本都是格式选错，必须明说，
-			// 否则页面上只显示「远程规则集 +1」、总数不动，看不出来。
+			// 走到这里说明四种格式都解析不出条目，基本是 URL 本身的问题。
 			b.sendMessage(chatID, fmt.Sprintf(
-				"⚠️ 规则集 %s 已保存，但按 %s 格式解析出 0 条。\n\n"+
-					"多半是格式选错了：这份列表如果是 clash 语法（每行 - DOMAIN-SUFFIX,xxx），"+
-					"选「纯域名」就会全军覆没。\n\n"+
-					"处理：📚 规则集 → 🗑 删规则集 删掉它，再重新添加并选对格式。",
-				name, fmtName), backOnly(
+				"⚠️ 规则集 %s 已保存，但 domain / clash / gfwlist / dnsmasq 四种格式都解析不出条目。\n\n"+
+					"常见原因：那个地址返回的是 HTML（404 页、登录页、GitHub 的提示页），或者列表是空的。\n\n"+
+					"先在浏览器打开该 URL 看一眼，确认是纯文本规则；确认后到 📚 规则集 删掉它再重加。", name), backOnly(
 				[]tgButton{{Text: "📚 规则集", CallbackData: "r:set"}}))
 			return
 		}
-		b.sendMessage(chatID, fmt.Sprintf("✅ 规则集 %s 已添加（格式 %s），解析出 %d 条，规则现共 %d 条",
+		b.sendMessage(chatID, fmt.Sprintf("✅ 规则集 %s 已添加（选的 %s），解析出 %d 条，规则现共 %d 条\n\n"+
+			"默认动作是走代理。如果这是国内直连表（dnsmasq-china-list 之类），"+
+			"记得点「🎯 分类 → 出口映射」把它改成直连，否则国内站会绕一圈 VPS。",
 			name, fmtName, added, rs.Count()), backOnly(
 			[]tgButton{{Text: "📚 规则集", CallbackData: "r:set"}}))
 

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -26,7 +27,7 @@ func LoadMergedRulesCached(cfg *Config, sources []RemoteSource) (*RuleSet, []Rul
 	return loadMerged(cfg, sources, loadRemoteSourceCached)
 }
 
-type sourceLoader func(RemoteSource, string) ([]Rule, error)
+type sourceLoader func(RemoteSource, string) ([]Rule, string, error)
 
 func loadMerged(cfg *Config, sources []RemoteSource, loader sourceLoader) (*RuleSet, []Rule, error) {
 	rs := &RuleSet{Final: ActionDirect}
@@ -51,10 +52,13 @@ func loadMerged(cfg *Config, sources []RemoteSource, loader sourceLoader) (*Rule
 
 	var remoteAll []Rule
 	for _, src := range sources {
-		rules, err := loader(src, cfg.Rules.CacheDir)
+		rules, usedFmt, err := loader(src, cfg.Rules.CacheDir)
 		if err != nil {
 			logf("warn", "规则源 %s 不可用: %v", src.Name, err)
 			continue
+		}
+		if want := strings.ToLower(src.Format); want != "" && want != "auto" && usedFmt != "" && usedFmt != want {
+			logf("info", "规则源 %s: 按 %s 解析不出条目，自动改用 %s", src.Name, want, usedFmt)
 		}
 		added := 0
 		for _, r := range rules {
@@ -67,7 +71,11 @@ func loadMerged(cfg *Config, sources []RemoteSource, loader sourceLoader) (*Rule
 			remoteAll = append(remoteAll, r)
 			added++
 		}
-		logf("info", "规则源 %s: 解析 %d 条，新增 %d 条", src.Name, len(rules), added)
+		if usedFmt != "" {
+			logf("info", "规则源 %s: 解析 %d 条，新增 %d 条（%s）", src.Name, len(rules), added, usedFmt)
+		} else {
+			logf("info", "规则源 %s: 解析 %d 条，新增 %d 条", src.Name, len(rules), added)
+		}
 	}
 	rs.Build()
 	return rs, remoteAll, nil
@@ -114,32 +122,46 @@ func StartRuleRefresher(cfg *Config, holder *ruleHolder, sources func() []Remote
 	}()
 }
 
-func loadRemoteSource(src RemoteSource, cacheDir string) ([]Rule, error) {
+func loadRemoteSource(src RemoteSource, cacheDir string) ([]Rule, string, error) {
 	body, err := fetchCached(src.URL, cacheDir)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return parseRemoteBody(body, src)
+	return parseRemoteBodyFmt(body, src)
 }
 
-func loadRemoteSourceCached(src RemoteSource, cacheDir string) ([]Rule, error) {
+func loadRemoteSourceCached(src RemoteSource, cacheDir string) ([]Rule, string, error) {
 	if cacheDir == "" {
-		return nil, fmt.Errorf("未配置 rules.cache_dir")
+		return nil, "", fmt.Errorf("未配置 rules.cache_dir")
 	}
 	body, err := os.ReadFile(filepath.Join(cacheDir, cacheName(src.URL)))
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	if len(body) == 0 {
-		return nil, fmt.Errorf("缓存为空")
+		return nil, "", fmt.Errorf("缓存为空")
 	}
-	return parseRemoteBody(body, src)
+	return parseRemoteBodyFmt(body, src)
 }
 
+// remoteFormats 是回退时依次尝试的解析格式，顺序按命中概率排。
+var remoteFormats = []string{"domain", "clash", "gfwlist", "dnsmasq"}
+
+// parseRemoteBody 只要规则，不要格式（大部分调用方够用）。
 func parseRemoteBody(body []byte, src RemoteSource) ([]Rule, error) {
+	rules, _, err := parseRemoteBodyFmt(body, src)
+	return rules, err
+}
+
+// parseRemoteBodyFmt 解析远程列表，同时返回实际生效的格式。
+//
+// 格式猜错不再直接判死：先按配置/内容选一个，解析不出条目就把剩下的格式
+// 挨个试一遍，哪种能出东西就用哪种。用户不需要知道自己在粘什么格式，
+// 日志里会写明最终用了哪个。四种都出不来才算失败。
+func parseRemoteBodyFmt(body []byte, src RemoteSource) ([]Rule, string, error) {
 	act, target, err := parseActionTarget(src.Action)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 	prefix := strings.ToUpper(src.Prefix)
 	switch prefix {
@@ -148,43 +170,77 @@ func parseRemoteBody(body []byte, src RemoteSource) ([]Rule, error) {
 		prefix = "DOMAIN-SUFFIX"
 	}
 
-	format := strings.ToLower(src.Format)
-	if format == "auto" {
-		switch {
-		case isLikelyBase64(body):
-			format = "gfwlist"
-		case strings.Contains(string(body), "DOMAIN-"):
-			format = "clash"
-		default:
-			format = "domain"
+	want := strings.ToLower(strings.TrimSpace(src.Format))
+	if want == "" {
+		want = "auto"
+	}
+
+	order := make([]string, 0, len(remoteFormats)+1)
+	if want != "auto" {
+		order = append(order, want)
+	}
+	for _, f := range append([]string{guessFormat(body)}, remoteFormats...) {
+		dup := false
+		for _, x := range order {
+			if x == f {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			order = append(order, f)
 		}
 	}
 
-	// clash 列表自带每条规则的类型，不能再用统一的 prefix 覆盖
-	if format == "clash" {
-		rules := parseClashRules(body, act, target)
-		if len(rules) == 0 {
-			return nil, fmt.Errorf("解析结果为空（format=%s）", src.Format)
+	var lastErr error
+	for _, f := range order {
+		rules := parseAsFormat(body, f, act, target, prefix)
+		if len(rules) > 0 {
+			return rules, f, nil
 		}
-		return rules, nil
+		if lastErr == nil {
+			lastErr = fmt.Errorf("按 %s 解析不出条目", f)
+		}
 	}
+	return nil, want, fmt.Errorf("解析结果为空（已尝试 %s）", strings.Join(order, " / "))
+}
 
-	var domains []string
-	switch format {
-	case "gfwlist":
-		domains = parseGFWList(body)
+// guessFormat 只看内容猜格式，猜不出来按纯域名。
+func guessFormat(body []byte) string {
+	s := string(body)
+	switch {
+	case isLikelyBase64(body):
+		return "gfwlist"
+	case strings.Contains(s, "server=/") || strings.Contains(s, "address=/"):
+		return "dnsmasq"
+	case strings.Contains(s, "DOMAIN-"):
+		return "clash"
 	default:
-		domains = parseDomainList(body)
+		return "domain"
 	}
-	if len(domains) == 0 {
-		return nil, fmt.Errorf("解析结果为空（format=%s）", src.Format)
-	}
+}
 
+// parseAsFormat 按指定格式解析；解析不出就是空切片，不报错——
+// 调用方要根据「是否为空」决定要不要换下一种格式。
+func parseAsFormat(body []byte, format string, act Action, target, prefix string) []Rule {
+	switch format {
+	case "clash":
+		return parseClashRules(body, act, target)
+	case "dnsmasq":
+		return rulesFromDomains(parseDnsmasq(body), act, target, prefix)
+	case "gfwlist":
+		return rulesFromDomains(parseGFWList(body), act, target, prefix)
+	default:
+		return rulesFromDomains(parseDomainList(body), act, target, prefix)
+	}
+}
+
+func rulesFromDomains(domains []string, act Action, target, prefix string) []Rule {
 	rules := make([]Rule, 0, len(domains))
 	for _, d := range domains {
 		rules = append(rules, Rule{Type: prefix, Value: d, Action: act, Target: target})
 	}
-	return rules, nil
+	return rules
 }
 
 // parseClashRules 保留列表里每条规则自己的类型。
@@ -349,6 +405,51 @@ func parseDomainList(body []byte) []string {
 		}
 		d := strings.ToLower(strings.TrimSuffix(strings.TrimPrefix(line, "."), "."))
 		if validDomain(d) {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// parseDnsmasq 从 dnsmasq 配置里取域名，认这三种写法：
+//
+//	server=/baidu.com/114.114.114.114
+//	address=/ads.example.com/0.0.0.0
+//	local=/intranet.lan/
+//
+// felixonmars/dnsmasq-china-list 就是第一种：一行一个域名，末尾接上游 DNS。
+// 一行带多个域名的写法（server=/a.com/b.com/1.1.1.1）也能全取出来。
+func parseDnsmasq(body []byte) []string {
+	var out []string
+	seen := make(map[string]struct{}, 1024)
+	for _, line := range strings.Split(string(body), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		var rest string
+		switch {
+		case strings.HasPrefix(line, "server=/"):
+			rest = strings.TrimPrefix(line, "server=")
+		case strings.HasPrefix(line, "address=/"):
+			rest = strings.TrimPrefix(line, "address=")
+		case strings.HasPrefix(line, "local=/"):
+			rest = strings.TrimPrefix(line, "local=")
+		default:
+			continue
+		}
+		for _, seg := range strings.Split(rest, "/") {
+			d := strings.ToLower(strings.TrimSpace(seg))
+			if d == "" || net.ParseIP(d) != nil {
+				continue // 空段和末尾的上游地址
+			}
+			if !validDomain(d) {
+				continue // 通配符 # 之类
+			}
+			if _, ok := seen[d]; ok {
+				continue
+			}
+			seen[d] = struct{}{}
 			out = append(out, d)
 		}
 	}

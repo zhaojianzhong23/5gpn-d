@@ -6,6 +6,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -112,24 +113,70 @@ func TestRemoteRuleCacheFallback(t *testing.T) {
 	srv.Close()
 }
 
-// 选错格式是最容易踩的坑：clash 列表按 domain 解析会得到 0 条。
-// 这里锁住两个行为：解析为空必须报错（而不是静默返回空表让别人以为加上了），
-// 以及 auto 能按内容把格式纠回来。
-func TestWrongFormatFailsLoudly(t *testing.T) {
+// 格式选错不再把人卡死：clash 列表按 domain 解析不出条目时，
+// 要自动退到 clash，并把实际用的格式报回去（日志和界面都靠它）。
+func TestWrongFormatRecovers(t *testing.T) {
 	clash := "- DOMAIN-SUFFIX,openai.com\n- DOMAIN-SUFFIX,github.com\n"
 
-	if _, err := parseRemoteBody([]byte(clash), RemoteSource{Format: "domain", Action: "proxy"}); err == nil {
-		t.Fatal("clash 内容按 domain 解析应当报错，不能静默返回空表")
-	}
-
-	rules, err := parseRemoteBody([]byte(clash), RemoteSource{Format: "auto", Action: "proxy"})
+	rules, used, err := parseRemoteBodyFmt([]byte(clash), RemoteSource{Format: "domain", Action: "proxy"})
 	if err != nil {
-		t.Fatalf("auto 应能识别 clash：%v", err)
+		t.Fatalf("应当自动换格式，而不是报错：%v", err)
+	}
+	if used != "clash" {
+		t.Fatalf("实际格式 = %q，应为 clash", used)
 	}
 	if len(rules) != 2 {
-		t.Fatalf("auto 解析出 %d 条，应为 2", len(rules))
+		t.Fatalf("解析出 %d 条，应为 2", len(rules))
 	}
 	if rules[0].Type != "DOMAIN-SUFFIX" || rules[0].Value != "openai.com" {
 		t.Fatalf("首条解析结果 = %+v", rules[0])
+	}
+}
+
+// dnsmasq-china-list 的写法：一行一个域名，末尾接上游 DNS。
+// 这是国内直连最常用的源，按纯域名解析会整行判非法、得到 0 条。
+func TestDnsmasqFormat(t *testing.T) {
+	body := "# 中国域名直连\n" +
+		"server=/baidu.com/114.114.114.114\n" +
+		"server=/qq.com/119.29.29.29\n" +
+		"address=/ads.example.com/0.0.0.0\n" +
+		"local=/intranet.lan/\n" +
+		"server=/a.com/b.com/1.1.1.1\n" +
+		"server=/#/1.1.1.1\n"
+
+	got := parseDnsmasq([]byte(body))
+	want := []string{"baidu.com", "qq.com", "ads.example.com", "intranet.lan", "a.com", "b.com"}
+	if len(got) != len(want) {
+		t.Fatalf("解析出 %v，应为 %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("第 %d 个 = %q，应为 %q（全量 %v）", i, got[i], want[i], got)
+		}
+	}
+
+	// auto 要能认出来，并按 action 打上直连
+	rules, used, err := parseRemoteBodyFmt([]byte(body), RemoteSource{Action: "direct"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if used != "dnsmasq" {
+		t.Fatalf("auto 判定为 %q，应为 dnsmasq", used)
+	}
+	for _, r := range rules {
+		if r.Action != ActionDirect {
+			t.Fatalf("动作 = %v，应为 direct", r.Action)
+		}
+	}
+}
+
+// 四种格式都解析不出东西时才报错，错误信息要列出试过哪些。
+func TestAllFormatsFail(t *testing.T) {
+	_, _, err := parseRemoteBodyFmt([]byte("这不是任何规则列表\n@@@@\n"), RemoteSource{Action: "proxy"})
+	if err == nil {
+		t.Fatal("垃圾内容应当报错")
+	}
+	if !strings.Contains(err.Error(), "已尝试") {
+		t.Fatalf("错误信息应说明尝试过哪些格式：%v", err)
 	}
 }
