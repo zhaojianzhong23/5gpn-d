@@ -230,7 +230,7 @@ else
     "state_file": "/var/lib/dotmux/tg-state.json",
     "profile_url": ""
   },
-  "quic": { "enabled": $([[ "$QUIC_ENABLED" == "1" ]] && echo true || echo false), "listen": ":443", "idle_sec": 30 }
+  "quic": { "enabled": $([[ "$QUIC_ENABLED" == "1" ]] && echo true || echo false), "listen": ":443", "idle_sec": 30, "udp_direct": false }
 }
 EOF
     ok "已写入 $CONF"

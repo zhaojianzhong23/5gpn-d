@@ -21,7 +21,7 @@ iPhone/Android ── DoT :853 ──► dotmux ──► 国内域名：返回�
 | DNS（853/DoT） | 按规则分成 `direct` / `proxy[:出口]` / `block`；`proxy` 的 A 记录返回网关 IP，`block` 返回 NXDOMAIN |
 | 记录抑制 | 对托管客户端拒绝 `AAAA`、`HTTPS`、`SVCB`，防止拿到真实地址绕过网关 |
 | TCP 443/80 | 从 ClientHello 读 SNI（HTTP 读 Host），按域名选出口转发 |
-| QUIC UDP/443 | 解密 QUIC v1 Initial 包取 SNI，其余数据原样中继；会话按来源地址维护，空闲回收 |
+| QUIC UDP/443 | 解密 QUIC v1 Initial 包取 SNI，按规则走 SOCKS5 UDP 关联或直连；会话按来源地址维护，空闲回收 |
 | 多出口 | `exits[]` 可放任意多个出口：`direct`、`socks5`，或直接粘 **ss / vmess / vless / trojan / hysteria2 / tuic / anytls** 分享链接（由内置 mihomo 落地）；规则用 `proxy:名字` 精确指定，默认出口 Bot 里一键切换 |
 | 规则 | 本地文件 + 定时拉取远程规则源（gfwlist / clash / 纯域名），失败回退上次缓存 |
 | 控制 | Telegram 面板：状态、出口增删改查与探测、规则与规则集增删、分类映射、DNS/域名/证书、日志、重启 |
@@ -80,6 +80,7 @@ sudo DOMAIN=dot.example.com EMAIL=you@example.com CLIENT_CIDR=172.22.0.0/16 \
 | `telegram.token` / `admin_ids` | Bot token 与允许操作的数字 ID |
 | `telegram.profile_url` | 描述文件下载地址，Bot 里出二维码 |
 | `quic.enabled` / `listen` / `idle_sec` | QUIC 中继开关、监听、会话空闲秒数 |
+| `quic.udp_direct` | 为 `true` 时 QUIC 一律从网关本机发出；默认 `false`，跟着规则走代理 |
 
 旧版只有 `socks5: "host:port"` 的配置可以继续用：启动时会自动升格成名为 `proxy` 的出口并设为默认。
 
@@ -179,10 +180,14 @@ FINAL,direct
 
 1. 从客户端第一个 Initial 包取 DCID，用 RFC 9001 的 v1 salt 派生 client initial 密钥；
 2. 去除 header protection、AES-GCM 解密，从 CRYPTO 帧里取 ClientHello 的 SNI；
-3. 按规则判定后，向上游真实地址建 UDP socket，后续包按来源地址直接透传；
+3. 按规则判定出口后，走 SOCKS5 UDP ASSOCIATE（`socks5` / `mihomo` 出口）或本机直连建立上行，后续包按来源地址直接透传；
 4. 会话空闲 `idle_sec` 秒回收。
 
-**限制：QUIC 只走直连，不走 SOCKS5**（UDP over SOCKS5 需要 UDP ASSOCIATE，没做）。如果你的落地是 SOCKS5，QUIC 流量会从网关本地出口出去，TCP 才走代理——这个不一致要知道。
+**QUIC 与 TCP 走同一个出口。** 规则判成 `proxy` 时，QUIC 通过 SOCKS5 UDP ASSOCIATE 让代理端解析域名并转发，源 IP 与 TCP 一致；代理不可用时直接丢弃，**不会悄悄回退成本机出口**——那等于把手机卡 IP 露出去。
+
+UDP 关联的代价：每个 QUIC 会话要额外占一条到代理的 TCP 控制连接（关掉即失效）。节点不支持 UDP 转发时（部分 ss/vmess 服务端没开 `udp`），QUIC 会连不上，浏览器随即回退 TCP，走 SNI 通道，不影响访问。
+
+想让 QUIC 一律从网关本机发出（例如代理不支持 UDP，或你就想让它走手机卡），设 `quic.udp_direct: true`。
 
 其他限制：只识别 QUIC v1（v2 和 draft 版本会解析失败并丢弃）；首包解析不出 SNI 就丢弃，不做跨包拼接。
 
@@ -200,7 +205,7 @@ bash scripts/make-profile.sh dot.example.com 203.0.113.10 > dotmux.mobileconfig
 
 ## 已知限制
 
-- **QUIC 不支持 SOCKS5 出口**，理由同上。
+- **QUIC 的 UDP 关联依赖节点支持 UDP 转发**，服务端没开 `udp` 时 QUIC 连不上（TCP 不受影响）。
 - **无 SNI 的连接无法还原目标**，直接断开（WhatsApp 部分流量属于这类）。
 - **无 Web 面板**，只有 Bot 和命令行。
 - **IPv4 only**，AAAA 一律拒绝。
@@ -219,6 +224,8 @@ go build -o dotmux .
 
 QUIC 测试用 `quic-go` 做客户端验证中继：故意破坏 SNI 解析后测试会超时失败，以此确认测的是真路径。
 
+`quic_proxy_test.go` 起一个只支持 UDP ASSOCIATE 的假 SOCKS5 端点，断言「代理端确实收到了 UDP 包」——把出口逻辑改回直连后这个断言立刻失败，避免用「能握手」冒充「走了代理」。
+
 | 文件 | 职责 |
 |---|---|
 | `main.go` | 启动、信号、组件装配 |
@@ -230,7 +237,8 @@ QUIC 测试用 `quic-go` 做客户端验证中继：故意破坏 SNI 解析后�
 | `dns.go` | DoT 服务、分流决策、缓存、上游转发 |
 | `sniproxy.go` | ClientHello/Host 解析与 TCP 转发 |
 | `quic.go` | QUIC Initial 解密、SNI 提取、UDP 中继 |
-| `socks5.go` | 最小 SOCKS5 客户端 |
+| `socks5.go` | 最小 SOCKS5 客户端（握手 + CONNECT） |
+| `socks5udp.go` | SOCKS5 UDP ASSOCIATE：建立关联、封装/解包数据报 |
 | `sysinfo.go` | 负载 / 内存 / 证书 / journalctl / 重启 / certbot |
 | `tgbot.go` | 长轮询、消息与回调 API、会话状态 |
 | `tgbot_pages.go` | 五个页面的渲染与所有按钮动作 |

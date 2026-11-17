@@ -132,6 +132,7 @@ func resolveA(upstreams []string, host string) (net.IP, error) {
 	m.RecursionDesired = true
 	var lastErr error
 	for _, up := range upstreams {
+		up = dnsAddr(up)
 		c := &dns.Client{Timeout: 3 * time.Second}
 		resp, _, err := c.Exchange(m, up)
 		if err != nil {

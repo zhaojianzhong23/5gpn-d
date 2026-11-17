@@ -70,6 +70,7 @@
   "quic": {
     "enabled": true,
     "listen": ":443",
-    "idle_sec": 30
+    "idle_sec": 30,
+    "udp_direct": false
   }
 }

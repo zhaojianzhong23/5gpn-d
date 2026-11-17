@@ -131,7 +131,11 @@ func (b *tgBot) renderStatus() (string, *tgKeyboard) {
 	sb.WriteString(fmt.Sprintf("%s DoT     %s\n", mark(health["dot"]), b.cfg.Listen.DoT))
 	sb.WriteString(fmt.Sprintf("%s SNI 转发 %s / %s\n", mark(health["sni"]), b.cfg.Listen.TLS, b.cfg.Listen.HTTP))
 	if b.deps.QUICOn {
-		sb.WriteString(fmt.Sprintf("%s QUIC    %s/udp\n", mark(health["quic"]), b.cfg.QUIC.Listen))
+		via := "随分流走代理"
+		if b.cfg.QUIC.UDPDirect {
+			via = "本机直连"
+		}
+		sb.WriteString(fmt.Sprintf("%s QUIC    %s/udp（%s）\n", mark(health["quic"]), b.cfg.QUIC.Listen, via))
 	} else {
 		sb.WriteString("➖ QUIC    未启用\n")
 	}

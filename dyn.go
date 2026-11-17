@@ -162,18 +162,27 @@ func (d *Dyn) Domain() string {
 	return d.domain
 }
 
-// DNS 返回国际、国内两组 DNS。
+// DNS 返回国际、国内两组 DNS（已补默认 53 端口）。
 func (d *Dyn) DNS() (remote, local []string) {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	return append([]string{}, d.remote...), append([]string{}, d.local...)
+	return normDNS(d.remote), normDNS(d.local)
+}
+
+// normDNS 复制一份并把裸 IP 补成 host:port，避免调用方各自踩坑。
+func normDNS(in []string) []string {
+	out := make([]string, 0, len(in))
+	for _, s := range in {
+		out = append(out, dnsAddr(s))
+	}
+	return out
 }
 
 // RemoteDNS 给 sniproxy 直连拨号时解析目标用（拿到境外真实地址）。
 func (d *Dyn) RemoteDNS() []string {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-	return append([]string{}, d.remote...)
+	return normDNS(d.remote)
 }
 
 // RoutingEnabled 表示是否按域名分流；关闭时所有托管流量走默认出口。

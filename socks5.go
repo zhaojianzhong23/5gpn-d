@@ -16,7 +16,9 @@ func dialSocks5(addr, host string, port int) (net.Conn, error) {
 	return dialSocks5Timeout(addr, host, port, 8*time.Second)
 }
 
-func dialSocks5Timeout(addr, host string, port int, timeout time.Duration) (net.Conn, error) {
+// socks5Handshake 连上代理并完成方法协商与认证，返回已就绪的控制连接。
+// 返回的连接仍带握手超时，调用方发完命令后应自行清除 deadline。
+func socks5Handshake(addr string, timeout time.Duration) (net.Conn, error) {
 	var user, pass string
 	target := addr
 	if i := strings.LastIndex(addr, "@"); i >= 0 {
@@ -81,6 +83,14 @@ func dialSocks5Timeout(addr, host string, port int, timeout time.Duration) (net.
 	default:
 		c.Close()
 		return nil, fmt.Errorf("代理不支持的方法: 0x%02x", resp[1])
+	}
+	return c, nil
+}
+
+func dialSocks5Timeout(addr, host string, port int, timeout time.Duration) (net.Conn, error) {
+	c, err := socks5Handshake(addr, timeout)
+	if err != nil {
+		return nil, err
 	}
 
 	// CONNECT，优先用域名让代理端解析（避免本地 DNS 污染与环路）

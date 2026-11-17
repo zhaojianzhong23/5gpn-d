@@ -84,10 +84,28 @@ type QUICConf struct {
 	Enabled bool   `json:"enabled"`
 	Listen  string `json:"listen"`
 	IdleSec int    `json:"idle_sec"`
+	// UDPDirect 为真时 QUIC 一律从网关本机网卡发出（源地址是网关自己的出口 IP）。
+	// 默认 false：QUIC 走规则命中出口的 SOCKS5 UDP 关联，与 TCP 出口保持一致。
+	UDPDirect bool `json:"udp_direct"`
 }
 
 // ExitDirect 是内置直连出口的默认名字。
 const ExitDirect = "local"
+
+// dnsAddr 把 "1.1.1.1" 这类裸地址补成 "1.1.1.1:53"。
+// miekg/dns 的 Exchange 要求 host:port，配置里写裸 IP 是常态，必须在这里兜住，
+// 否则上游全部报 "missing port in address"，DNS 转发和直连会一起失效。
+func dnsAddr(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return s
+	}
+	if _, _, err := net.SplitHostPort(s); err == nil {
+		return s
+	}
+	// 纯 IPv6 字面量（可能带方括号）没有端口，统一补 53
+	return net.JoinHostPort(strings.Trim(s, "[]"), "53")
+}
 
 func defaultConfig() *Config {
 	c := &Config{}

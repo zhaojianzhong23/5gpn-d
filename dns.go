@@ -188,6 +188,7 @@ func (s *dnsSvc) exchange(req *dns.Msg) (*dns.Msg, error) {
 	}
 	var lastErr error
 	for _, up := range local {
+		up = dnsAddr(up)
 		c := &dns.Client{Timeout: 3 * time.Second}
 		if resp, _, err := c.Exchange(req, up); err == nil {
 			return resp, nil

@@ -38,17 +38,45 @@ type quicRelay struct {
 }
 
 type quicSession struct {
-	client   *net.UDPAddr
-	upstream *net.UDPConn
-	target   string
-	last     atomic.Int64
-	once     sync.Once
+	client *net.UDPAddr
+	up     udpPeer
+	target string
+	last   atomic.Int64
+	once   sync.Once
 }
+
+// udpPeer 抽象一条已绑定目标的 UDP 上行，直连与 SOCKS5 UDP 关联共用同一套收发逻辑。
+type udpPeer interface {
+	Write([]byte) error
+	Read([]byte) (int, error)
+	Close() error
+}
+
+// directUDP 从网关本机网卡直接发出，源地址即网关自己的出口 IP。
+type directUDP struct{ c *net.UDPConn }
+
+func (d *directUDP) Write(b []byte) error       { _, err := d.c.Write(b); return err }
+func (d *directUDP) Read(b []byte) (int, error) { return d.c.Read(b) }
+func (d *directUDP) Close() error               { return d.c.Close() }
+
+// proxiedUDP 通过 SOCKS5 UDP 关联转发，目标域名交给代理端解析。
+type proxiedUDP struct {
+	s    *socksUDP
+	host string
+	port int
+}
+
+func (p *proxiedUDP) Write(b []byte) error { return p.s.WriteTo(p.host, p.port, b) }
+func (p *proxiedUDP) Read(b []byte) (int, error) {
+	n, _, _, err := p.s.ReadFrom(b)
+	return n, err
+}
+func (p *proxiedUDP) Close() error { return p.s.Close() }
 
 func (s *quicSession) touch() { s.last.Store(time.Now().Unix()) }
 
 func (s *quicSession) close() {
-	s.once.Do(func() { _ = s.upstream.Close() })
+	s.once.Do(func() { _ = s.up.Close() })
 }
 
 func startQUIC(cfg *Config, rules func() *RuleSet, dyn *Dyn) error {
@@ -94,7 +122,7 @@ func (r *quicRelay) run() {
 		if v, ok := r.sess.Load(addr.String()); ok {
 			s := v.(*quicSession)
 			s.touch()
-			if _, err := s.upstream.Write(pkt); err != nil {
+			if err := s.up.Write(pkt); err != nil {
 				r.sess.Delete(addr.String())
 				s.close()
 			}
@@ -115,50 +143,74 @@ func (r *quicRelay) handleNew(addr *net.UDPAddr, pkt []byte) {
 	if !inNets(addr.IP, r.nets) {
 		return // 非托管来源不接管
 	}
-	act := ActionProxy
+	act, target := ActionProxy, ""
 	if r.dyn.RoutingEnabled() {
-		act, _ = r.rules().MatchRoute(host)
+		act, target = r.rules().MatchRoute(host)
 	}
 	if act == ActionBlock {
 		logf("info", "block(quic) %s from %s", host, addr.IP)
 		return
 	}
 
-	// QUIC 走 UDP，无法穿过 SOCKS5（需要 UDP ASSOCIATE），所以统一从网关本机出口；
-	// 用国际 DNS 解析，拿到的是源站真实地址。
-	ip, err := resolveA(r.dyn.RemoteDNS(), host)
-	if err != nil {
-		logf("warn", "QUIC 解析目标失败 %s: %v", host, err)
-		return
-	}
 	port := r.port
 	if port == 0 {
 		port = 443
 	}
-	up, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: ip, Port: port})
+
+	// 规则说走代理就必须走代理。UDP 穿 SOCKS5 靠 UDP ASSOCIATE，
+	// 关掉 udp_direct 时绝不在失败后偷偷回退本机出口 —— 那等于把手机卡 IP 露出去。
+	exit := Exit{Name: ExitDirect, Type: "direct"}
+	if act == ActionProxy && !r.cfg.QUIC.UDPDirect {
+		exit = r.dyn.Resolve(target)
+	}
+	up, err := r.newPeer(exit, host, port)
 	if err != nil {
-		logf("warn", "QUIC 连接 %s(%s) 失败: %v", host, ip, err)
+		logf("warn", "QUIC 转发 %s（出口 %s）失败: %v", host, exit.Name, err)
 		return
 	}
-	s := &quicSession{client: addr, upstream: up, target: host}
+
+	s := &quicSession{client: addr, up: up, target: host}
 	s.touch()
 	if _, loaded := r.sess.LoadOrStore(addr.String(), s); loaded {
 		s.close()
 		return
 	}
 	go r.pumpBack(s)
-	if _, err := up.Write(pkt); err != nil {
+	if err := s.up.Write(pkt); err != nil {
 		r.sess.Delete(addr.String())
 		s.close()
-		return
 	}
-	logf("debug", "quic %s -> %s", host, ip)
+}
+
+// newPeer 按出口类型选择上行方式：socks5/mihomo 走 UDP 关联，其余本机直连。
+func (r *quicRelay) newPeer(exit Exit, host string, port int) (udpPeer, error) {
+	if exit.Type == "socks5" || exit.Type == "mihomo" {
+		if exit.Addr == "" {
+			return nil, fmt.Errorf("出口未就绪（内核可能没启动）")
+		}
+		su, err := dialSocks5UDP(exit.Addr, 5*time.Second)
+		if err != nil {
+			return nil, err
+		}
+		logf("debug", "quic %s -> %s 经出口 %s", host, exit.Addr, exit.Name)
+		return &proxiedUDP{s: su, host: host, port: port}, nil
+	}
+	ip, err := resolveA(r.dyn.RemoteDNS(), host)
+	if err != nil {
+		return nil, err
+	}
+	uc, err := net.DialUDP("udp", nil, &net.UDPAddr{IP: ip, Port: port})
+	if err != nil {
+		return nil, err
+	}
+	logf("debug", "quic %s -> %s 直连", host, ip)
+	return &directUDP{c: uc}, nil
 }
 
 func (r *quicRelay) pumpBack(s *quicSession) {
 	buf := make([]byte, 65535)
 	for {
-		n, err := s.upstream.Read(buf)
+		n, err := s.up.Read(buf)
 		if err != nil {
 			r.sess.Delete(s.client.String())
 			s.close()
