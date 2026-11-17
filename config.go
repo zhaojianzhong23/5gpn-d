@@ -22,6 +22,9 @@ type Config struct {
 	CacheSize    int       `json:"cache_size"`
 	SyntheticTTL uint32    `json:"synthetic_ttl"`
 	Log          LogConfig `json:"log"`
+	Rules        RulesConf `json:"rules"`
+	Telegram     TGConf    `json:"telegram"`
+	QUIC         QUICConf  `json:"quic"`
 }
 
 type Listen struct {
@@ -32,6 +35,35 @@ type Listen struct {
 
 type LogConfig struct {
 	Level string `json:"level"`
+}
+
+// RulesConf 描述远程规则源。
+type RulesConf struct {
+	Remote       []RemoteSource `json:"remote"`
+	RefreshHours int            `json:"refresh_hours"`
+	CacheDir     string         `json:"cache_dir"`
+}
+
+// RemoteSource 是一个可定时拉取的规则地址。
+type RemoteSource struct {
+	URL    string `json:"url"`
+	Format string `json:"format"` // domain | gfwlist | clash | auto
+	Action string `json:"action"` // proxy | direct | block
+	Prefix string `json:"prefix"` // DOMAIN-SUFFIX（默认）| DOMAIN | DOMAIN-KEYWORD
+	Name   string `json:"name"`
+}
+
+type TGConf struct {
+	Token      string  `json:"token"`
+	AdminIDs   []int64 `json:"admin_ids"`
+	StateFile  string  `json:"state_file"`
+	ProfileURL string  `json:"profile_url"`
+}
+
+type QUICConf struct {
+	Enabled bool   `json:"enabled"`
+	Listen  string `json:"listen"`
+	IdleSec int    `json:"idle_sec"`
 }
 
 func defaultConfig() *Config {
@@ -47,6 +79,11 @@ func defaultConfig() *Config {
 	c.CacheSize = 8192
 	c.SyntheticTTL = 60
 	c.Log.Level = "info"
+	c.Rules.RefreshHours = 24
+	c.Rules.CacheDir = "/var/lib/dotmux/rules"
+	c.Telegram.StateFile = "/var/lib/dotmux/tg-state.json"
+	c.QUIC.Listen = ":443"
+	c.QUIC.IdleSec = 30
 	return c
 }
 
@@ -95,6 +132,39 @@ func (c *Config) validate() error {
 	}
 	if c.SyntheticTTL == 0 {
 		c.SyntheticTTL = 60
+	}
+	if c.Rules.RefreshHours <= 0 {
+		c.Rules.RefreshHours = 24
+	}
+	if c.Rules.CacheDir == "" {
+		c.Rules.CacheDir = "/var/lib/dotmux/rules"
+	}
+	if c.Telegram.StateFile == "" {
+		c.Telegram.StateFile = "/var/lib/dotmux/tg-state.json"
+	}
+	if c.QUIC.Listen == "" {
+		c.QUIC.Listen = ":443"
+	}
+	if c.QUIC.IdleSec <= 0 {
+		c.QUIC.IdleSec = 30
+	}
+	for i := range c.Rules.Remote {
+		r := &c.Rules.Remote[i]
+		if r.URL == "" {
+			return fmt.Errorf("rules.remote[%d].url 不能为空", i)
+		}
+		if r.Format == "" {
+			r.Format = "auto"
+		}
+		if r.Action == "" {
+			r.Action = "proxy"
+		}
+		if r.Prefix == "" {
+			r.Prefix = "DOMAIN-SUFFIX"
+		}
+		if r.Name == "" {
+			r.Name = fmt.Sprintf("source-%d", i+1)
+		}
 	}
 	return nil
 }

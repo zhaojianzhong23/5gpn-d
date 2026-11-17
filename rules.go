@@ -48,6 +48,55 @@ type Rule struct {
 type RuleSet struct {
 	Rules []Rule
 	Final Action
+
+	// 索引：远程规则动辄十万条，线性扫描会成为每次查询的瓶颈。
+	exact map[string]idxRule
+	suff  map[string]idxRule
+	kws   []kwRule
+	built bool
+}
+
+type idxRule struct {
+	order  int
+	action Action
+}
+
+type kwRule struct {
+	order  int
+	value  string
+	action Action
+}
+
+// Build 建立匹配索引。同名条目只保留顺序最靠前的一条，因为 first-match 之后
+// 的同名规则永远不会生效。
+func (rs *RuleSet) Build() {
+	rs.exact = make(map[string]idxRule, len(rs.Rules))
+	rs.suff = make(map[string]idxRule, len(rs.Rules))
+	rs.kws = make([]kwRule, 0, 16)
+	for i := range rs.Rules {
+		r := &rs.Rules[i]
+		switch r.Type {
+		case "DOMAIN":
+			if _, ok := rs.exact[r.Value]; !ok {
+				rs.exact[r.Value] = idxRule{order: i, action: r.Action}
+			}
+		case "DOMAIN-SUFFIX":
+			if _, ok := rs.suff[r.Value]; !ok {
+				rs.suff[r.Value] = idxRule{order: i, action: r.Action}
+			}
+		case "DOMAIN-KEYWORD":
+			if r.Value != "" {
+				rs.kws = append(rs.kws, kwRule{order: i, value: r.Value, action: r.Action})
+			}
+		}
+	}
+	rs.built = true
+}
+
+func newRuleSet(rules []Rule, final Action) *RuleSet {
+	rs := &RuleSet{Rules: rules, Final: final}
+	rs.Build()
+	return rs
 }
 
 // LoadRules 解析 clash 风格规则文件，一行一条，first-match。
@@ -121,6 +170,7 @@ func LoadRules(path string) (*RuleSet, error) {
 	if err := sc.Err(); err != nil {
 		return nil, err
 	}
+	rs.Build()
 	if len(skipped) > 0 {
 		uniq := map[string]bool{}
 		var names []string
@@ -138,6 +188,46 @@ func LoadRules(path string) (*RuleSet, error) {
 // Match 返回域名对应的动作，未命中返回 Final。
 func (rs *RuleSet) Match(domain string) Action {
 	d := strings.ToLower(strings.TrimSuffix(domain, "."))
+	if !rs.built {
+		return rs.linearMatch(d)
+	}
+
+	best := 1 << 30
+	var act Action
+	found := false
+
+	if r, ok := rs.exact[d]; ok {
+		best, act, found = r.order, r.action, true
+	}
+	// DOMAIN-SUFFIX 包含域名自身，再逐级去掉最左标签
+	if r, ok := rs.suff[d]; ok && r.order < best {
+		best, act, found = r.order, r.action, true
+	}
+	for i := 0; i < len(d); i++ {
+		if d[i] != '.' {
+			continue
+		}
+		if r, ok := rs.suff[d[i+1:]]; ok && r.order < best {
+			best, act, found = r.order, r.action, true
+		}
+	}
+	// kws 按规则顺序升序，命中第一条即最优
+	for _, k := range rs.kws {
+		if k.order >= best {
+			break
+		}
+		if strings.Contains(d, k.value) {
+			best, act, found = k.order, k.action, true
+			break
+		}
+	}
+	if found {
+		return act
+	}
+	return rs.Final
+}
+
+func (rs *RuleSet) linearMatch(d string) Action {
 	for i := range rs.Rules {
 		r := &rs.Rules[i]
 		switch r.Type {

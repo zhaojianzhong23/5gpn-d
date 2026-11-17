@@ -17,16 +17,17 @@ import (
 type snipSvc struct {
 	cfg   *Config
 	rules func() *RuleSet
+	socks func() string
 	nets  []*net.IPNet
 }
 
-func newSnipSvc(cfg *Config, rules func() *RuleSet) *snipSvc {
-	return &snipSvc{cfg: cfg, rules: rules, nets: cfg.ClientNets()}
+func newSnipSvc(cfg *Config, rules func() *RuleSet, socks func() string) *snipSvc {
+	return &snipSvc{cfg: cfg, rules: rules, socks: socks, nets: cfg.ClientNets()}
 }
 
 // startSNI 监听 443 / 80，按 SNI 或 Host 还原目标后转发。
-func startSNI(cfg *Config, rules func() *RuleSet) {
-	s := newSnipSvc(cfg, rules)
+func startSNI(cfg *Config, rules func() *RuleSet, socks func() string) {
+	s := newSnipSvc(cfg, rules, socks)
 	listeners := []struct {
 		addr  string
 		isTLS bool
@@ -90,8 +91,8 @@ func (s *snipSvc) handle(c net.Conn, isTLS bool) {
 		port = 80
 	}
 	var upstream net.Conn
-	if s.cfg.Socks5 != "" {
-		upstream, err = dialSocks5(s.cfg.Socks5, host, port)
+	if exit := s.socks(); exit != "" {
+		upstream, err = dialSocks5(exit, host, port)
 	} else {
 		upstream, err = s.dialResolved(host, port)
 	}

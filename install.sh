@@ -22,6 +22,9 @@ EMAIL="${EMAIL:-}"
 GATEWAY_IP="${GATEWAY_IP:-}"
 CLIENT_CIDR="${CLIENT_CIDR:-172.22.0.0/16}"
 SOCKS5="${SOCKS5:-}"
+TG_TOKEN="${TG_TOKEN:-}"
+TG_ADMINS="${TG_ADMINS:-}"
+QUIC_ENABLED="${QUIC_ENABLED:-1}"
 
 if [[ -z "$DOMAIN" ]]; then
     read -r -p "DoT 域名（A 记录已指向本机）: " DOMAIN
@@ -33,6 +36,21 @@ if [[ -z "$GATEWAY_IP" ]]; then
 fi
 if [[ -z "$GATEWAY_IP" ]]; then
     read -r -p "本机公网 IPv4: " GATEWAY_IP
+fi
+
+if [[ -t 0 && -z "$TG_TOKEN" ]]; then
+    read -r -p "Telegram Bot Token（回车跳过，可稍后再填）: " TG_TOKEN
+fi
+if [[ -t 0 && -z "$TG_ADMINS" && -n "$TG_TOKEN" ]]; then
+    read -r -p "允许操作的 Telegram 数字 ID（逗号分隔）: " TG_ADMINS
+fi
+if [[ -t 0 ]]; then
+    read -r -p "启用 QUIC 中继 UDP/443? [Y/n]: " _q
+    [[ "$_q" == "n" || "$_q" == "N" ]] && QUIC_ENABLED=0
+fi
+ADMIN_JSON="[]"
+if [[ -n "$TG_ADMINS" ]]; then
+    ADMIN_JSON="[$(printf '%s' "$TG_ADMINS" | tr -d ' ')]"
 fi
 [[ -n "$GATEWAY_IP" ]] || { err "需要公网 IPv4"; exit 1; }
 
@@ -94,7 +112,27 @@ else
   "rules_file": "$RULES",
   "cache_size": 8192,
   "synthetic_ttl": 60,
-  "log": { "level": "info" }
+  "log": { "level": "info" },
+  "rules": {
+    "refresh_hours": 24,
+    "cache_dir": "/var/lib/dotmux/rules",
+    "remote": [
+      {
+        "name": "gfw",
+        "url": "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/gfw.txt",
+        "format": "domain",
+        "prefix": "DOMAIN-SUFFIX",
+        "action": "proxy"
+      }
+    ]
+  },
+  "telegram": {
+    "token": "$TG_TOKEN",
+    "admin_ids": $ADMIN_JSON,
+    "state_file": "/var/lib/dotmux/tg-state.json",
+    "profile_url": ""
+  },
+  "quic": { "enabled": $([[ "$QUIC_ENABLED" == "1" ]] && echo true || echo false), "listen": ":443", "idle_sec": 30 }
 }
 EOF
     ok "已写入 $CONF"
@@ -167,8 +205,9 @@ cat <<EOF
   规则文件   : $RULES
 
   端口放行（按你的防火墙工具二选一）：
-    ufw allow 853/tcp && ufw allow 80/tcp && ufw allow 443/tcp
+    ufw allow 853/tcp && ufw allow 80/tcp && ufw allow 443/tcp && ufw allow 443/udp
     nft add rule inet filter input tcp dport { 80, 443, 853 } accept
+    nft add rule inet filter input udp dport 443 accept
 
   改完规则热重载：systemctl reload dotmux
   看日志        ：journalctl -u dotmux -f
