@@ -144,7 +144,14 @@ func (b *tgBot) renderStatus() (string, *tgKeyboard) {
 
 	sb.WriteString(fmt.Sprintf("🌐 出口    %s\n", exitLabel(dyn.Resolve(""))))
 	sb.WriteString(fmt.Sprintf("🔗 域名    %s\n", dom))
+	sb.WriteString(fmt.Sprintf("🏠 网关    %s\n", b.cfg.GatewayIP))
 	sb.WriteString(fmt.Sprintf("⚡ 分流    %s\n", onOff(dyn.RoutingEnabled())))
+	// 来源网段决定“哪些查询算我的设备”，填错等于整套策略不生效，必须能一眼核对
+	cidr := "未配置"
+	if len(b.cfg.ClientCIDR) > 0 {
+		cidr = strings.Join(b.cfg.ClientCIDR, ", ")
+	}
+	sb.WriteString(fmt.Sprintf("📱 来源    %s\n", cidr))
 	sb.WriteString(fmt.Sprintf("📋 规则    %d 条 · 本地手写 %d 条\n", total, local))
 	if rs != nil {
 		sb.WriteString(fmt.Sprintf("🎯 兜底    FINAL %s\n", rs.Final.String()))

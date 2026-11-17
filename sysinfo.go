@@ -5,6 +5,7 @@ import (
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"strconv"
@@ -349,4 +350,41 @@ func humanDur(d time.Duration) string {
 
 func timeoutCtx(d time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), d)
+}
+
+// DetectLocalIP 返回本机上落在给定网段内的第一个 IPv4 地址。
+// 定向内网卡场景里，这个地址才是客户端能路由到的网关地址；
+// 没有的话才该退回公网 IP。
+func DetectLocalIP(cidrs []string) string {
+	var nets []*net.IPNet
+	for _, s := range cidrs {
+		if n, err := parseCIDR(s); err == nil {
+			nets = append(nets, n)
+		}
+	}
+	if len(nets) == 0 {
+		return ""
+	}
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, ifc := range ifaces {
+		addrs, err := ifc.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			ipnet, ok := a.(*net.IPNet)
+			if !ok {
+				continue
+			}
+			ip := ipnet.IP.To4()
+			if ip == nil || ip.IsLoopback() || !inNets(ip, nets) {
+				continue
+			}
+			return ip.String()
+		}
+	}
+	return ""
 }

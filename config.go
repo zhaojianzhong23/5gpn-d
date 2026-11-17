@@ -11,11 +11,13 @@ import (
 
 // Config 是 /etc/dotmux/config.json 的结构。
 type Config struct {
-	Listen       Listen    `json:"listen"`
-	Domain       string    `json:"domain"`
-	CertFile     string    `json:"cert_file"`
-	KeyFile      string    `json:"key_file"`
-	GatewayIP    string    `json:"gateway_ip"`
+	Listen    Listen `json:"listen"`
+	Domain    string `json:"domain"`
+	CertFile  string `json:"cert_file"`
+	KeyFile   string `json:"key_file"`
+	GatewayIP string `json:"gateway_ip"`
+	// gatewayAuto 记录网关地址是自动探测来的，仅用于启动日志，不参与序列化。
+	gatewayAuto  bool      `json:"-"`
 	ClientCIDR   []string  `json:"client_cidr"`
 	UpstreamDNS  []string  `json:"upstream_dns"`
 	RemoteDNS    []string  `json:"remote_dns"`
@@ -169,8 +171,21 @@ func (c *Config) migrate() {
 }
 
 func (c *Config) validate() error {
+	for _, n := range c.ClientCIDR {
+		if _, err := parseCIDR(n); err != nil {
+			return fmt.Errorf("client_cidr 非法: %s", n)
+		}
+	}
+	// 没填网关地址时，先在本机网卡里找落在 client_cidr 内的地址。
+	// 定向内网卡一般会给 VPS 侧一个同段私网地址，用它比公网 IP 更合适。
 	if c.GatewayIP == "" {
-		return errors.New("gateway_ip 不能为空")
+		if ip := DetectLocalIP(c.ClientCIDR); ip != "" {
+			c.GatewayIP = ip
+			c.gatewayAuto = true
+		}
+	}
+	if c.GatewayIP == "" {
+		return errors.New("gateway_ip 不能为空（本机没有落在 client_cidr 内的地址，请手动填写手机能访问到的地址）")
 	}
 	if net.ParseIP(c.GatewayIP) == nil {
 		return fmt.Errorf("gateway_ip 不是合法 IP: %s", c.GatewayIP)
@@ -191,11 +206,6 @@ func (c *Config) validate() error {
 	c.RemoteDNS = normalizeDNS(c.RemoteDNS)
 	c.UpstreamDNS = c.LocalDNS
 
-	for _, n := range c.ClientCIDR {
-		if _, err := parseCIDR(n); err != nil {
-			return fmt.Errorf("client_cidr 非法: %s", n)
-		}
-	}
 	if c.CacheSize < 0 {
 		c.CacheSize = 0
 	}

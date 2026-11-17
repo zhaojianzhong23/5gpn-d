@@ -1,6 +1,7 @@
 package main
 
 import (
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -74,4 +75,88 @@ func TestConfigRejectNoDirectExit(t *testing.T) {
 	if err := cfg.validate(); err == nil {
 		t.Fatal("缺少 direct 出口应报错")
 	}
+}
+
+// 直接填单个内网 IP 也应可用（自动视作 /32），不要逼用户写掩码。
+func TestClientCIDRBareIP(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.GatewayIP = "203.0.113.10"
+	cfg.CertFile = "/etc/letsencrypt/live/dot.test/fullchain.pem"
+	cfg.KeyFile = "/etc/letsencrypt/live/dot.test/privkey.pem"
+	cfg.ClientCIDR = []string{"172.22.1.10"}
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("裸 IP 应通过校验: %v", err)
+	}
+	nets := cfg.ClientNets()
+	if len(nets) != 1 || nets[0].String() != "172.22.1.10/32" {
+		t.Fatalf("解析结果 = %v", nets)
+	}
+	if !inNets(net.ParseIP("172.22.1.10"), nets) {
+		t.Error("本机 IP 应判为托管")
+	}
+	if inNets(net.ParseIP("172.22.1.11"), nets) {
+		t.Error("相邻 IP 不应判为托管")
+	}
+}
+
+// 默认 /16 必须覆盖 172.22.1.10，否则装完就分流不生效。
+func TestDefaultCIDRCoversCardIP(t *testing.T) {
+	cfg := defaultConfig()
+	ip := net.ParseIP("172.22.1.10")
+	if !inNets(ip, cfg.ClientNets()) {
+		t.Fatalf("默认 %v 未覆盖 %s", cfg.ClientCIDR, ip)
+	}
+}
+
+// 本机有落在 client_cidr 内的地址时，应自动拿来当网关地址。
+func TestGatewayIPAutoDetect(t *testing.T) {
+	local := firstLocalIPv4()
+	if local == "" {
+		t.Skip("本机没有非回环 IPv4")
+	}
+	cfg := defaultConfig()
+	cfg.CertFile = "/etc/letsencrypt/live/dot.test/fullchain.pem"
+	cfg.KeyFile = "/etc/letsencrypt/live/dot.test/privkey.pem"
+	cfg.ClientCIDR = []string{local + "/32"}
+	cfg.GatewayIP = ""
+	if err := cfg.validate(); err != nil {
+		t.Fatalf("应自动探测到网关地址: %v", err)
+	}
+	if cfg.GatewayIP != local {
+		t.Fatalf("探测结果 = %s, 期望 %s", cfg.GatewayIP, local)
+	}
+	if !cfg.gatewayAuto {
+		t.Error("应标记为自动探测")
+	}
+}
+
+// 网段内没有本机地址时必须报错，而不是静默用一个错地址。
+func TestGatewayIPNoMatch(t *testing.T) {
+	cfg := defaultConfig()
+	cfg.CertFile = "/etc/letsencrypt/live/dot.test/fullchain.pem"
+	cfg.KeyFile = "/etc/letsencrypt/live/dot.test/privkey.pem"
+	cfg.ClientCIDR = []string{"10.99.99.0/24"}
+	cfg.GatewayIP = ""
+	if err := cfg.validate(); err == nil {
+		t.Fatal("网段内没有本机地址应报错")
+	}
+}
+
+func firstLocalIPv4() string {
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, ifc := range ifaces {
+		addrs, err := ifc.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, a := range addrs {
+			if n, ok := a.(*net.IPNet); ok && n.IP.To4() != nil && !n.IP.IsLoopback() {
+				return n.IP.String()
+			}
+		}
+	}
+	return ""
 }

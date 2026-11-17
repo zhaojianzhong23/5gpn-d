@@ -32,7 +32,7 @@ iPhone/Android ── DoT :853 ──► dotmux ──► 国内域名：返回�
 
 1. 有公网 IPv4 的 VPS（Debian 12+ / Ubuntu 22.04+），root；
 2. 一个域名，A 记录指向该 VPS（DoT 证书，需 TCP/80 可签 Let's Encrypt，Cloudflare 用灰云）；
-3. 一个固定来源网段 `client_cidr` —— **网关靠来源网段判断"这条查询是我的设备发的"**。手机流量若没有固定私网源段，这套方案不成立；
+3. 一个固定来源网段 `client_cidr` —— **网关靠来源网段判断"这条查询是我的设备发的"**。手机流量若没有固定私网源段，这套方案不成立；装的时候会问，手机卡只给单个 IP（如 `172.22.1.10`）也可以直接填，程序按 `/32` 处理；
 4. 可选：一个或多个 SOCKS5 落地（没有则用网关公网出口直连）。
 
 放行：TCP `853`、`80`、`443`，UDP `443`。
@@ -64,8 +64,8 @@ sudo DOMAIN=dot.example.com EMAIL=you@example.com CLIENT_CIDR=172.22.0.0/16 \
 | `listen.dot` / `tls` / `http` | `:853` / `:443` / `:80`，置空关闭 |
 | `domain` | 当前域名，Bot 里可改；留空时从证书路径推断 |
 | `cert_file` / `key_file` | 证书路径，每次握手读取，支持热续期 |
-| `gateway_ip` | 代理域名返回给手机的地址 |
-| `client_cidr` | 受管来源网段，可多条 |
+| `gateway_ip` | 代理域名返回给手机的地址；**留空自动取**本机落在 `client_cidr` 内的地址，没有才报错 |
+| `client_cidr` | 受管来源网段，可多条；单张卡直接写 IP 也行（自动按 `/32`） |
 | `remote_dns` | 国际 DNS，用于解析代理域名的真实地址 |
 | `local_dns` | 国内 DNS，用于直连域名的真实解析（旧字段 `upstream_dns` 自动视为它） |
 | `exits[]` | 出口表：`{name, type: direct|socks5, addr}`，至少要有一个 direct |

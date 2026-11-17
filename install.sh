@@ -20,7 +20,7 @@ command -v systemctl >/dev/null || { err "需要 systemd"; exit 1; }
 DOMAIN="${DOMAIN:-}"
 EMAIL="${EMAIL:-}"
 GATEWAY_IP="${GATEWAY_IP:-}"
-CLIENT_CIDR="${CLIENT_CIDR:-172.22.0.0/16}"
+CLIENT_CIDR="${CLIENT_CIDR:-}"
 SOCKS5="${SOCKS5:-}"
 TG_TOKEN="${TG_TOKEN:-}"
 TG_ADMINS="${TG_ADMINS:-}"
@@ -31,11 +31,52 @@ if [[ -z "$DOMAIN" ]]; then
 fi
 [[ -n "$DOMAIN" ]] || { err "域名不能为空"; exit 1; }
 
+# 这个字段决定“哪些来源算我的设备”，填错整套分流都不生效，先问清楚。
+# 手机卡给的是单个 IP 也能直接填，程序会按 /32 处理。
+if [[ -t 0 && -z "$CLIENT_CIDR" ]]; then
+    read -r -p "手机卡内网 IP 或网段（如 172.22.1.10，回车用 172.22.0.0/16）: " CLIENT_CIDR
+fi
+CLIENT_CIDR="${CLIENT_CIDR:-172.22.0.0/16}"
+
+# 定向内网卡的 VPS 侧通常也有一个同段私网地址，它比公网 IP 更适合写进 DNS 应答：
+# 手机在内网里直接连它，不用绕公网。
+detect_local_ip() {
+    local cidr="$1" addr bits pfx
+    addr="${cidr%%/*}"
+    bits="${cidr##*/}"
+    if [[ "$addr" == "$cidr" ]]; then bits=32; fi
+    case "$bits" in
+        8)  pfx="${addr%%.*}" ;;
+        16) pfx="${addr%%.*.*}" ;;
+        24) pfx="${addr%.*.*.*}" ;;
+        32) ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 \
+                | grep -Fx "$addr" | head -1 || true
+            return 0 ;;
+        *)  return 0 ;;
+    esac
+    pfx="$pfx."
+    ip -4 -o addr show 2>/dev/null | awk '{print $4}' | cut -d/ -f1 \
+        | grep -v '^127\.' | grep -F "$pfx" | head -1 || true
+}
+
 if [[ -z "$GATEWAY_IP" ]]; then
-    GATEWAY_IP="$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+    GATEWAY_IP="$(detect_local_ip "$CLIENT_CIDR")"
+    if [[ -n "$GATEWAY_IP" ]]; then
+        info "检测到本机在 $CLIENT_CIDR 内的地址：$GATEWAY_IP"
+    fi
 fi
 if [[ -z "$GATEWAY_IP" ]]; then
-    read -r -p "本机公网 IPv4: " GATEWAY_IP
+    GATEWAY_IP="$(curl -4 -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+    if [[ -n "$GATEWAY_IP" ]]; then
+        warn "本机没有落在 $CLIENT_CIDR 内的地址，网关地址暂用公网 IP $GATEWAY_IP"
+    fi
+fi
+if [[ -z "$GATEWAY_IP" ]]; then
+    read -r -p "手机能访问到的网关 IPv4: " GATEWAY_IP
+fi
+if [[ -t 0 ]]; then
+    read -r -p "  网关地址（手机会连这个）[$GATEWAY_IP]: " _gw
+    if [[ -n "$_gw" ]]; then GATEWAY_IP="$_gw"; fi
 fi
 
 if [[ -t 0 && -z "$TG_TOKEN" ]]; then
@@ -46,7 +87,7 @@ if [[ -t 0 && -z "$TG_ADMINS" && -n "$TG_TOKEN" ]]; then
 fi
 if [[ -t 0 ]]; then
     read -r -p "启用 QUIC 中继 UDP/443? [Y/n]: " _q
-    [[ "$_q" == "n" || "$_q" == "N" ]] && QUIC_ENABLED=0
+    if [[ "$_q" == "n" || "$_q" == "N" ]]; then QUIC_ENABLED=0; fi
 fi
 ADMIN_JSON="[]"
 if [[ -n "$TG_ADMINS" ]]; then
@@ -219,6 +260,7 @@ cat <<EOF
   DoT 域名   : $DOMAIN:853
   网关地址   : $GATEWAY_IP
   客户端网段 : $CLIENT_CIDR
+  网关地址   : $GATEWAY_IP（手机连这个）
   默认出口   : $DEF_EXIT
   配置文件   : $CONF
   规则文件   : $RULES

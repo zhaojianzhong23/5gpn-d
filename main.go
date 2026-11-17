@@ -133,8 +133,12 @@ func main() {
 		},
 	}
 
-	logf("info", "dotmux %s 启动，网关 %s，出口 %s，规则 %d 条，客户端网段 %s",
-		version, cfg.GatewayIP, strings.Join(dyn.ExitNames(), "/"), rules.Count(),
+	gwNote := ""
+	if cfg.gatewayAuto {
+		gwNote = "（自动探测自 client_cidr）"
+	}
+	logf("info", "dotmux %s 启动，网关 %s%s，出口 %s，规则 %d 条，客户端网段 %s",
+		version, cfg.GatewayIP, gwNote, strings.Join(dyn.ExitNames(), "/"), rules.Count(),
 		strings.Join(cfg.ClientCIDR, ","))
 
 	if _, err := startDoT(cfg, holder.get, dyn, tlsCfg); err != nil {
