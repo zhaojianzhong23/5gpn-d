@@ -228,10 +228,39 @@ upgrade_if_needed() {
     echo "  要退回旧版：sudo bash install.sh --force（会装上最新版，旧版请手动放回）"
 }
 
+# 已是最新版也别直接退出：上一次可能停在“服务没起来”这步（端口被占、被谁 stop 过），
+# 那种半装状态靠重跑本脚本才补得回来，而版本号一样恰恰是最常见的重跑场景。
+ensure_service_running() {
+    if [[ ! -f /etc/systemd/system/dotmux.service ]]; then
+        err "有二进制和配置，但没有 systemd unit（上次停在更早的阶段）"
+        echo "  修：删掉 ${CONF} 后重跑本脚本，会走完整安装流程"
+        return 1
+    fi
+    systemctl enable dotmux >/dev/null 2>&1 || true
+    if systemctl is-active --quiet dotmux; then
+        ok "服务在跑（$("$BIN" -version 2>/dev/null || echo dotmux)）"
+        return 0
+    fi
+    info "服务没在运行，尝试启动..."
+    systemctl restart dotmux 2>/dev/null || true
+    sleep 2
+    if systemctl is-active --quiet dotmux; then
+        ok "服务已启动"
+        echo "  验收：journalctl -u dotmux -n 20 --no-pager"
+        return 0
+    fi
+    err "启动失败，原因通常是端口被占（853 必须是 DoT、443 给 SNI）："
+    ss -lntup 2>/dev/null | grep -E ':(443|853)' || true
+    echo "---"
+    journalctl -u dotmux -n 30 --no-pager 2>/dev/null || true
+    return 1
+}
+
 # 装过就只做升级检查，不再重复装依赖、签证书
 if [[ -x "$BIN" && -f "$CONF" ]]; then
-    upgrade_if_needed "$FORCE"
-    exit $?
+    upgrade_if_needed "$FORCE" || exit 1
+    ensure_service_running || exit 1
+    exit 0
 fi
 
 if [[ -z "$DOMAIN" ]]; then
