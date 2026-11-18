@@ -148,6 +148,9 @@ type dnsSvc struct {
 	// 启动时确定，避免每包解析
 	gatewayV4 net.IP
 	ecs       net.IP
+	// geoip 按真实 IP 归属分流。
+	geoipOn   bool
+	geoipMode string
 }
 
 func newDNSSvc(cfg *Config, rules func() *RuleSet, dyn *Dyn) *dnsSvc {
@@ -161,6 +164,8 @@ func newDNSSvc(cfg *Config, rules func() *RuleSet, dyn *Dyn) *dnsSvc {
 		cache:     cache,
 		gatewayV4: net.ParseIP(cfg.GatewayIP).To4(),
 		ecs:       net.ParseIP(cfg.ECS).To4(),
+		geoipOn:   cfg.GeoIP.Enabled,
+		geoipMode: cfg.GeoIP.Mode,
 	}
 }
 
@@ -203,10 +208,38 @@ func (s *dnsSvc) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	if s.dyn.RoutingEnabled() {
 		act, _ = s.rules().MatchRoute(name)
 	}
-	switch act {
-	case ActionBlock:
+
+	// 两条铁律，geoip 不得覆盖：
+	//  1. Block：域名规则明确拦截（广告等）。
+	//  2. noProxy：推送/邮件/STUN 走非标端口，解析成网关地址会连到没人监听的
+	//     端口，必须直连真实 IP。这些域名本来就该直连，geoip 不参与。
+	if act == ActionBlock {
 		s.replyEmpty(w, req, dns.RcodeNameError)
 		return
+	}
+	if noProxyMatch(name) {
+		s.forward(w, req, s.ecs)
+		return
+	}
+
+	// GEOIP：解析真实 IP，按归属决定直连还是代理。
+	// 这一步会对原本判 proxy 的域名也做一次真实解析——但它复用了 forward 的
+	// 缓存与单飞，而且 SNI 转发层随后本来就要解析同一个域名（sharedResolve），
+	// 两张缓存各自命中，实际每个域名只打一次上游。
+	if s.geoipOn && s.dyn.RoutingEnabled() {
+		final := s.geoipDecide(name, act, req)
+		switch final {
+		case ActionDirect:
+			s.forward(w, req, s.ecs)
+			return
+		case ActionProxy:
+			s.replyA(w, req, q, s.gatewayV4, s.cfg.SyntheticTTL)
+			return
+		}
+		// final == ActionUnknown：解析失败，回退到域名规则的动作
+	}
+
+	switch act {
 	case ActionProxy:
 		// 返回网关地址，客户端把流量交给 443/80 的 SNI 转发
 		s.replyA(w, req, q, s.gatewayV4, s.cfg.SyntheticTTL)
@@ -214,6 +247,65 @@ func (s *dnsSvc) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	default:
 		s.forward(w, req, s.ecs)
 	}
+}
+
+// ActionUnknown 表示 geoip 无法判定（解析失败/无 A 记录），调用方回退域名规则。
+const ActionUnknown Action = -1
+
+// geoipDecide 按真实 IP 归属决定动作。
+//
+// full：CN IP → 直连，海外 IP → 代理。彻底按归属，覆盖域名后缀的猜测。
+// 这正是"国外域名走 VPS 出口、国内域名走手机卡"的目标，且不再需要逐域名加规则。
+//
+// correct：保守模式，只在"域名规则判直连、但 IP 却在海外"时改判代理——
+// 专治恩山这种 .cn 却在海外的情况，不动域名规则明确要代理的域名。
+//
+// 返回 ActionUnknown 表示解析失败，交给调用方按原域名规则处理。
+func (s *dnsSvc) geoipDecide(name string, domainAct Action, req *dns.Msg) Action {
+	// 显式代理规则（gfwlist / 内置 TikTok 兜底等）直接尊重，不做 IP 归属判定：
+	// 省一次真实解析，也避免被墙域名恰好解析到中国 IP 时被误判成直连。
+	if exAct, _, ok := s.rules().MatchExplicit(name); ok && exAct == ActionProxy {
+		return ActionProxy
+	}
+
+	key := cacheKey(req, s.ecs)
+	resp, err := s.resolveForGeoIP(key, req)
+	if err != nil || resp == nil {
+		return ActionUnknown
+	}
+	ips := aRecordsFromMsg(resp)
+	if len(ips) == 0 {
+		return ActionUnknown
+	}
+	isCN := cnIPSet.AnyCN(ips)
+	switch s.geoipMode {
+	case "correct":
+		if domainAct == ActionDirect && !isCN {
+			return ActionProxy // 域名判直连但 IP 在海外：纠偏为代理
+		}
+		return domainAct
+	default: // full
+		if isCN {
+			return ActionDirect
+		}
+		return ActionProxy
+	}
+}
+
+// resolveForGeoIP 取缓存/单飞解析结果，但不写出——归属判定要复用同一份应答。
+func (s *dnsSvc) resolveForGeoIP(key string, req *dns.Msg) (*dns.Msg, error) {
+	if r, stale := s.cache.getWithStale(key); r != nil {
+		if stale {
+			s.refreshAsync(key, req, s.ecs)
+		}
+		return r, nil
+	}
+	resp, err := s.exchangeShared(key, req, s.ecs)
+	if err != nil {
+		return nil, err
+	}
+	s.store(key, resp)
+	return resp, nil
 }
 
 func (s *dnsSvc) replyA(w dns.ResponseWriter, req *dns.Msg, q dns.Question, ip net.IP, ttl uint32) {

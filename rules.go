@@ -351,6 +351,64 @@ func (rs *RuleSet) MatchRoute(domain string) (Action, string) {
 	return act, target
 }
 
+// MatchExplicit 只匹配显式的域名规则，不套用 FINAL。
+// GEOIP 判定用它识别"规则明确要求代理"的域名：这类直接代理，
+// 既省一次真实解析（gfwlist 绝大多数是国外域名），也避免极点情况下
+// 被墙域名解析到中国 IP 时被归属判定覆盖成直连。
+// 返回值第三个表示是否命中任何显式规则。
+func (rs *RuleSet) MatchExplicit(domain string) (Action, string, bool) {
+	d := strings.ToLower(strings.TrimSuffix(domain, "."))
+	if noProxyMatch(d) {
+		return ActionDirect, "", true
+	}
+	if !rs.built {
+		for i := range rs.Rules {
+			r := &rs.Rules[i]
+			hit := false
+			switch r.Type {
+			case "DOMAIN":
+				hit = d == r.Value
+			case "DOMAIN-SUFFIX":
+				hit = d == r.Value || strings.HasSuffix(d, "."+r.Value)
+			case "DOMAIN-KEYWORD":
+				hit = r.Value != "" && strings.Contains(d, r.Value)
+			}
+			if hit {
+				return r.Action, r.Target, true
+			}
+		}
+		return ActionDirect, "", false
+	}
+	best := 1 << 30
+	act := ActionDirect
+	target := ""
+	found := false
+	if r, ok := rs.exact[d]; ok {
+		best, act, target, found = r.order, r.action, r.target, true
+	}
+	if r, ok := rs.suff[d]; ok && r.order < best {
+		best, act, target, found = r.order, r.action, r.target, true
+	}
+	for i := 0; i < len(d); i++ {
+		if d[i] != '.' {
+			continue
+		}
+		if r, ok := rs.suff[d[i+1:]]; ok && r.order < best {
+			best, act, target, found = r.order, r.action, r.target, true
+		}
+	}
+	for _, k := range rs.kws {
+		if k.order >= best {
+			break
+		}
+		if strings.Contains(d, k.value) {
+			act, target, found = k.action, k.target, true
+			break
+		}
+	}
+	return act, target, found
+}
+
 func (rs *RuleSet) linearMatch(d string) Action {
 	act, _ := rs.linearMatchRoute(d)
 	return act

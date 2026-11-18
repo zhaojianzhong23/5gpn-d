@@ -56,6 +56,16 @@ type Config struct {
 	Rules    RulesConf `json:"rules"`
 	Telegram TGConf    `json:"telegram"`
 	QUIC     QUICConf  `json:"quic"`
+	// GeoIP 按解析出的真实 IP 归属分流，而非按域名后缀猜。
+	// full：CN IP 直连、海外 IP 代理，覆盖域名规则（noProxy 白名单与 block 除外）；
+	// correct：只纠正"域名判直连但 IP 在海外"的误判，不动显式代理规则。
+	GeoIP GeoIPConf `json:"geoip"`
+}
+
+// GeoIPConf 是按 IP 归属分流的配置。
+type GeoIPConf struct {
+	Enabled bool   `json:"enabled"`
+	Mode    string `json:"mode"` // full | correct
 }
 
 type Listen struct {
@@ -167,6 +177,10 @@ func defaultConfig() *Config {
 	c.Telegram.StateFile = "/var/lib/dotmux/tg-state.json"
 	c.QUIC.Listen = ":443"
 	c.QUIC.IdleSec = 30
+	// GEOIP 默认关闭，保持既有行为不变；在 config.json 里显式开启。
+	// 这样升级/新装不会因为 IP 库判定而改变分流语义，出问题随时能关回去。
+	c.GeoIP.Enabled = false
+	c.GeoIP.Mode = "full"
 	return c
 }
 
@@ -294,6 +308,15 @@ func (c *Config) validate() error {
 	}
 	if c.QUIC.IdleSec <= 0 {
 		c.QUIC.IdleSec = 30
+	}
+	if c.GeoIP.Mode == "" {
+		c.GeoIP.Mode = "full"
+	}
+	c.GeoIP.Mode = strings.ToLower(strings.TrimSpace(c.GeoIP.Mode))
+	switch c.GeoIP.Mode {
+	case "full", "correct":
+	default:
+		return fmt.Errorf("geoip.mode 非法: %q（full / correct）", c.GeoIP.Mode)
 	}
 	if c.Domain == "" {
 		c.Domain = domainFromCertPath(c.CertFile)
