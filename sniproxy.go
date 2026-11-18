@@ -255,7 +255,7 @@ func (s *snipSvc) handle(c net.Conn, isTLS bool) {
 	defer upstream.Close()
 
 	_ = upstream.SetDeadline(time.Now().Add(2 * time.Minute))
-	pump(br, upstream, c)
+	pump(br, upstream, c, 30*time.Second)
 	logf("debug", "%s %s:%d via %s %dms", classify(isTLS), host, port, exit.Name, time.Since(start).Milliseconds())
 }
 
@@ -484,24 +484,55 @@ func parseHostHeader(b []byte) (string, error) {
 	return "", errors.New("HTTP 无 Host 头")
 }
 
-func pump(br *bufio.Reader, upstream net.Conn, client net.Conn) {
+// pump 双向转发。核心原则：任一路结束就【完全关闭两端】，让另一路立刻返回。
+//
+// fd 泄漏根因：旧版任一路结束后只调 CloseWrite（半关闭），上游连接仍活着，
+// 另一路 io.Copy 继续等远端响应。手机浏览器大量 keep-alive 短连接，客户端
+// 早关了，但服务端这半关闭的连接还挂着，goroutine + splice pipe 长期不释放，
+// 缓慢累积到 fd 耗尽（EMFILE）→ 443 accept 失败 → GitHub 偶发 404。
+//
+// io.Copy 在 socket→socket 时走 splice(2)，Go 每次为它建一个 pipe；连接不
+// 回收，pipe 就不回收。所以必须：第一路一结束，立即 Close 两端，第二路的
+// splice/read 会因连接关闭而马上出错返回，两路 goroutine 和 pipe 全部回收。
+//
+// timeout 是整机兜底：极端情况下两路都不结束（如对端半开不读不写），到点
+// 强制关闭。正常连接靠"任一路结束即关闭"早已回收，不会等到超时。
+func pump(br *bufio.Reader, upstream net.Conn, client net.Conn, timeout time.Duration) {
 	done := make(chan struct{}, 2)
 	go func() {
 		_, _ = io.Copy(upstream, br)
-		if tc, ok := upstream.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
-		}
 		done <- struct{}{}
 	}()
 	go func() {
 		_, _ = io.Copy(client, upstream)
-		if tc, ok := client.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
-		}
 		done <- struct{}{}
 	}()
-	<-done
-	<-done
+
+	// 关一次就够：net.Conn.Close 幂等，多处调用安全。
+	closeBoth := func() {
+		_ = upstream.Close()
+		_ = client.Close()
+	}
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		// 任一路结束：立刻完全关闭两端，打断另一路。
+		closeBoth()
+		<-done // 等另一路退出（关闭后它会立即返回）
+	case <-timer.C:
+		// 兜底：两路都没结束，强制关闭并等它们退出。
+		closeBoth()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+		}
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+		}
+	}
 }
 
 // isSelfTarget 判断转发目标会不会解析到网关自己（公网网关 IP）。
