@@ -105,8 +105,15 @@ type QUICConf struct {
 	Enabled bool   `json:"enabled"`
 	Listen  string `json:"listen"`
 	IdleSec int    `json:"idle_sec"`
-	// UDPDirect 为真时 QUIC 一律从网关本机网卡发出（源地址是网关自己的出口 IP）。
-	// 默认 false：QUIC 走规则命中出口的 SOCKS5 UDP 关联，与 TCP 出口保持一致。
+	// UDPDirect 只表示「出口不支持 UDP 时，允许 QUIC 回退到网关本机直连」。
+	//
+	// 以前它的含义是「QUIC 一律从本机发出」——规则说走代理时 TCP 从代理节点
+	// 出去、QUIC 却从网关 IP 出去，同一个会话的流量来自两个不同地址。
+	// TikTok 这类服务会按 IP 做一致性校验，后续分片被降级或丢弃，表现就是
+	// 「看几个视频就卡住」，而纯 TCP 的 Telegram 一点事没有。
+	//
+	// 默认 false：QUIC 与 TCP 严格走同一条出口。出口不吃 UDP（naive、
+	// snell v1/v2）时让 QUIC 直接失败，客户端几秒内回落 TCP，仍然同一条出口。
 	UDPDirect bool `json:"udp_direct"`
 }
 

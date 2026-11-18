@@ -62,6 +62,24 @@ type quicRelay struct {
 // maxQUICSessions 是同时在册的 QUIC 会话上限。
 const maxQUICSessions = 2048
 
+// quicIdleMin 是会话空闲回收的下限。
+//
+// 这里踩过坑：配置里 idle_sec 写 30 秒，手机端 QUIC 的保活间隔往往也是
+// 20~30 秒，两边一卡边就可能先被我们回收。会话一关，后续属于它的短头包
+// 全部找不到归属、直接丢弃，而客户端的加密帧我们看不见，它只能等 PING
+// 超时（也是几十秒）才重连——用户看到的就是「视频卡在那儿不动」。
+// 所以回收只做兜底，别跟对端的保活抢时间。
+const quicIdleMin = 120 * time.Second
+
+// quicIdle 取配置值和下限的较大者。
+func quicIdle(sec int) time.Duration {
+	d := time.Duration(sec) * time.Second
+	if d < quicIdleMin {
+		return quicIdleMin
+	}
+	return d
+}
+
 // maxQUICDatagram 是单条 QUIC 报文的读缓冲。链路 MTU 一般 1500，给到 4096
 // 留足余量；取 65535 的话每条会话常驻 64KB，两千条就是 128MB。
 const maxQUICDatagram = 4096
@@ -218,7 +236,7 @@ func startQUIC(cfg *Config, rules func() *RuleSet, dyn *Dyn) (*quicRelay, error)
 		rules: rules,
 		dyn:   dyn,
 		nets:  cfg.ClientNets(),
-		idle:  time.Duration(cfg.QUIC.IdleSec) * time.Second,
+		idle:  quicIdle(cfg.QUIC.IdleSec),
 		port:  443,
 		addrs: make(map[string]quicAddr),
 		done:  make(chan struct{}),
@@ -406,14 +424,28 @@ func (r *quicRelay) handleNew(addr *net.UDPAddr, pkt []byte) {
 		port = 443
 	}
 
-	// 规则说走代理就必须走代理。UDP 穿 SOCKS5 靠 UDP ASSOCIATE，
-	// 关掉 udp_direct 时绝不在失败后偷偷回退本机出口 —— 那等于把手机卡 IP 露出去。
+	// QUIC 必须跟 TCP 走同一条出口。
+	//
+	// 以前 udp_direct=true 时，规则说走代理的域名仍然是 TCP 走代理节点、
+	// QUIC 从网关本机发出——同一个会话的流量来自两个不同 IP。TikTok 这类
+	// 服务会按 IP 做一致性校验，后面的分片要么被降级要么被丢，症状正是
+	// 「看几个视频就卡住」，而纯 TCP 的 Telegram 完全正常。
 	exit := Exit{Name: ExitDirect, Type: "direct"}
-	if act == ActionProxy && !r.cfg.QUIC.UDPDirect {
+	if act == ActionProxy {
 		exit = r.dyn.Resolve(target)
 	}
 	up, err := r.newPeer(exit, host, port)
+	if err != nil && act == ActionProxy && r.cfg.QUIC.UDPDirect {
+		// 明确的逃生阀：出口不吃 UDP（naive / snell v1-v2）时允许回退本机。
+		// 会把网关 IP 露给对端，所以只在配置里显式打开时才走这条路。
+		up, err = r.newPeer(Exit{Name: ExitDirect, Type: "direct"}, host, port)
+		if err == nil {
+			logf("warn", "QUIC %s 经出口 %s 不可用，按 udp_direct 回退本机直连（对端会看到网关 IP）", host, exit.Name)
+		}
+	}
 	if err != nil {
+		// 不回退直连是刻意的：让 QUIC 快速失败，客户端几秒内回落 TCP，
+		// 而 TCP 走的是同一条出口，IP 仍然一致。
 		logf("warn", "QUIC 转发 %s（出口 %s）失败: %v", host, exit.Name, err)
 		return
 	}

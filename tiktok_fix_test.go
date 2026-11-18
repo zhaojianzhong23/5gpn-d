@@ -14,9 +14,9 @@ import (
 
 func TestResolveCacheReuse(t *testing.T) {
 	var calls int32
-	c := newResolveCache(func(ups []string, host string) (net.IP, error) {
+	c := newResolveCache(func(ups []string, host string) ([]net.IP, time.Duration, error) {
 		atomic.AddInt32(&calls, 1)
-		return net.ParseIP("9.9.9.9"), nil
+		return []net.IP{net.ParseIP("9.9.9.9")}, time.Minute, nil
 	})
 
 	for i := 0; i < 5; i++ {
@@ -40,9 +40,9 @@ func TestResolveCacheReuse(t *testing.T) {
 
 func TestResolveCacheIPShortCircuit(t *testing.T) {
 	var calls int32
-	c := newResolveCache(func(ups []string, host string) (net.IP, error) {
+	c := newResolveCache(func(ups []string, host string) ([]net.IP, time.Duration, error) {
 		atomic.AddInt32(&calls, 1)
-		return nil, errors.New("不该被调用")
+		return nil, 0, errors.New("不该被调用")
 	})
 	ip, err := c.Lookup(nil, "1.2.3.4")
 	if err != nil || ip.String() != "1.2.3.4" {
@@ -56,10 +56,10 @@ func TestResolveCacheIPShortCircuit(t *testing.T) {
 func TestResolveCacheSingleFlight(t *testing.T) {
 	var calls int32
 	release := make(chan struct{})
-	c := newResolveCache(func(ups []string, host string) (net.IP, error) {
+	c := newResolveCache(func(ups []string, host string) ([]net.IP, time.Duration, error) {
 		atomic.AddInt32(&calls, 1)
 		<-release
-		return net.ParseIP("5.5.5.5"), nil
+		return []net.IP{net.ParseIP("5.5.5.5")}, time.Minute, nil
 	})
 
 	var wg sync.WaitGroup
@@ -83,9 +83,9 @@ func TestResolveCacheSingleFlight(t *testing.T) {
 
 func TestResolveCacheNegative(t *testing.T) {
 	var calls int32
-	c := newResolveCache(func(ups []string, host string) (net.IP, error) {
+	c := newResolveCache(func(ups []string, host string) ([]net.IP, time.Duration, error) {
 		atomic.AddInt32(&calls, 1)
-		return nil, errors.New("NXDOMAIN")
+		return nil, 0, errors.New("NXDOMAIN")
 	})
 	if _, err := c.Lookup(nil, "nope.test"); err == nil {
 		t.Fatal("应该返回错误")
