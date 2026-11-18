@@ -82,6 +82,18 @@ log "GFWList proxy: $GW 条"
     [[ -s "$WORK/proxy.conf" ]] && cat "$WORK/proxy.conf"
     cat "$WORK/direct.conf"
     echo ""
+    # --- 手动固化：ChinaList 没收录但必须直连的国内域名 ---
+    # .cn 兜底：银行/政务/国内服务的 .cn 域名若不在 ChinaList 里，
+    #   会落 FINAL,proxy 绕到 VPS 再反代回国内，导致银行 APP 卡。
+    echo "DOMAIN-SUFFIX,cn,direct"
+    echo "DOMAIN-SUFFIX,com.cn,direct"
+    echo "DOMAIN-SUFFIX,ip.cn,direct"
+    echo "DOMAIN-SUFFIX,qpic.cn,direct"
+    echo "DOMAIN-SUFFIX,gtimg.cn,direct"
+    echo "DOMAIN-SUFFIX,qlogo.cn,direct"
+    echo "DOMAIN-SUFFIX,qq.com.cn,direct"
+    echo "DOMAIN-SUFFIX,qualcomm.cn,direct"
+    echo ""
     echo "FINAL,proxy"
 } > "$WORK/rules.conf"
 
