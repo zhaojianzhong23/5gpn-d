@@ -9,6 +9,11 @@ CONF="$CONF_DIR/config.json"
 RULES="$CONF_DIR/rules.conf"
 SERVICE=/etc/systemd/system/dotmux.service
 
+# 代理内核版本：1.19.34 起才有 snell v6（v6 是 PSK 派生的分片混淆层），
+# 旧版遇到 version: 6 会直接报 "snell version error"。
+# 放在文件顶部是因为 --diag 也要用它显示「要求 ≥ x」。
+MIHOMO_VERSION="${MIHOMO_VERSION:-1.19.34}"
+
 RED='\033[0;31m'; GREEN='\033[0;32m'; BLUE='\033[0;34m'; YELLOW='\033[0;33m'; NC='\033[0m'
 info() { printf "${BLUE}[INFO]${NC} %s\n" "$*"; }
 ok()   { printf "${GREEN}[ OK ]${NC} %s\n" "$*"; }
@@ -39,13 +44,30 @@ curl_err() {
     esac
 }
 
+# 镜像列表统一成「以 / 结尾」再拼 URL。
+# 用户手写 GITHUB_MIRRORS="https://ghfast.top"（少个斜杠）时，
+# 直接拼会变成 https://ghfast.tophttps://github.com/...，报的错和镜像无关。
+mirror_urls() {
+    local p
+    for p in ${GITHUB_MIRRORS//,/ }; do
+        # 反复去掉结尾斜杠再加一个：https://x// 会变成 https://x//，拼出来是
+        # 「https://x//https://github.com/…」，有的镜像会 404。
+        while [[ "$p" == */ ]]; do p="${p%/}"; done
+        [[ -n "$p" ]] && printf '%s/\n' "$p"
+    done
+    return 0
+}
+
 # dl <目标文件> <GitHub 原始 URL> [超时秒]
 dl() {
     local out="$1" url="$2" tmo="${3:-180}" p rc
     DL_DIAG=""
-    for p in "" ${GITHUB_MIRRORS//,/ }; do
+    for p in "" $(mirror_urls); do
         rc=0
+        # --speed-limit/--speed-time：镜像挂着不动时（连上了但几乎没数据）
+        # 及时放弃换下一条，不然 --max-time 600 会让人干等十分钟。
         curl -fsSL --connect-timeout 8 --max-time "$tmo" --retry 2 --retry-delay 2 \
+             --speed-limit 2048 --speed-time 30 \
              -o "$out" "${p}${url}" 2>/dev/null || rc=$?
         if [[ $rc -eq 0 && -s "$out" ]]; then
             [[ -n "$p" ]] && info "下载走镜像 ${p%/}"
@@ -223,6 +245,17 @@ diag() {
     else
         printf '  代理变量    : 无\n'
     fi
+    # 已装版本也打出来：「升级完了但内核没变」这类问题，一眼就能看出是哪个没跟上。
+    # 用 command -v 先判断，否则命令不存在时 bash 自己会往 stderr 吐一行
+    # "mihomo: command not found"，重定向盖不住，混在自检输出里很像报错。
+    local dv mv
+    dv=$("$BIN" -version 2>/dev/null | awk '{print $2}' || true)
+    mv=""
+    if command -v mihomo >/dev/null 2>&1; then
+        mv=$(mihomo -v 2>/dev/null | sed -n 's/.*[[:space:]]v\([0-9][0-9.]*\).*/\1/p' | head -1 || true)
+    fi
+    printf '  dotmux      : %s\n' "${dv:-未安装}"
+    printf '  mihomo      : %s（要求 ≥ %s）\n' "${mv:-未安装}" "${MIHOMO_VERSION}"
 
     echo
     echo "连通性："
@@ -232,8 +265,10 @@ diag() {
     probe "raw.githubusercontent" https://raw.githubusercontent.com
     echo "  镜像："
     local p
-    for p in ${GITHUB_MIRRORS//,/ }; do
-        probe "${p%/}" "${p}https://github.com/${REPO}/releases/latest"
+    for p in $(mirror_urls); do
+        # 用 HEAD：有些镜像对 release 页的 GET 会挂着不走（curl 52 空应答），
+        # 但 HEAD 能正常回状态，用它判断「这个镜像通不通」更准
+        probe "${p%/}" "${p}https://github.com/${REPO}/releases/latest" -I
     done
 
     echo
@@ -263,20 +298,26 @@ diag() {
 # 谁新用谁；两个都拿不到就返回空，由调用方决定本次不升级。
 latest_tag() {
     local web="" api="" p t
-    for p in "" ${GITHUB_MIRRORS//,/ }; do
-        if [[ -z "$web" ]]; then
-            t=$(curl -fsSIL --connect-timeout 6 --max-time 15 -o /dev/null -w '%{url_effective}' \
-                "${p}https://github.com/${REPO}/releases/latest" 2>/dev/null | sed -n 's#.*/tag/##p')
-            web=$(norm_tag "$t")
-        fi
-        if [[ -z "$api" ]]; then
-            t=$(curl -fsS --connect-timeout 6 --max-time 15 -H 'Accept: application/vnd.github+json' \
-                "${p}https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
-                | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
-            api=$(norm_tag "$t")
-        fi
-        [[ -n "$web" && -n "$api" ]] && break
+
+    # API 只直连问。几个常见镜像（ghfast / ghproxy）只代理 github.com，
+    # 对 api.github.com 直接回 403，跟着试只是白白多等几个超时。
+    #
+    # 每个赋值都要 || true：curl 失败时管道非零，norm_tag 没匹配上也返回 1，
+    # 而这两个都是「查不到版本」的正常分支 —— 不兜住会被 set -e 当成致命错误。
+    t=$(curl -fsS --connect-timeout 5 --max-time 8 -H 'Accept: application/vnd.github+json' \
+        "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
+        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1 || true)
+    api=$(norm_tag "$t" || true)
+
+    # 网页重定向：直连 + 各镜像，谁先给出 tag 用谁。超时压到 8 秒，
+    # 全被封时 4 条通道最多等半分钟，不至于让人以为卡死。
+    for p in "" $(mirror_urls); do
+        t=$(curl -fsSIL --connect-timeout 5 --max-time 8 -o /dev/null -w '%{url_effective}' \
+            "${p}https://github.com/${REPO}/releases/latest" 2>/dev/null | sed -n 's#.*/tag/##p' || true)
+        web=$(norm_tag "$t" || true)
+        [[ -n "$web" ]] && break
     done
+
     if [[ -z "$web" ]]; then printf '%s' "$api"; return; fi
     if [[ -z "$api" ]]; then printf '%s' "$web"; return; fi
     if ver_gt "${web#v}" "${api#v}"; then
@@ -289,7 +330,9 @@ latest_tag() {
 upgrade_if_needed() {
     local force="$1" cur latest arch base url tmp newbin offline=0
     MODE=upgrade
-    cur=$("$BIN" -version 2>/dev/null | awk '{print $2}')
+    # || true：二进制损坏时 `-version` 会非零退出，set -e 会让脚本在
+    # 「检查环境」这一步静默死掉，反而查不出是二进制坏了。
+    cur=$("$BIN" -version 2>/dev/null | awk '{print $2}' || true)
     cur="${cur:-dev}"
 
     # 离线模式：给了本地包就直接装它。这里必须绕开版本探测 ——
@@ -306,7 +349,8 @@ upgrade_if_needed() {
     if [[ "$offline" -eq 0 ]]; then
         info "已安装：${cur}，检查是否有新版本..."
         latest="${LATEST:-}"
-        [[ -n "$latest" ]] || latest=$(latest_tag)
+        # latest_tag 内部已经全兜住了，这里的 || true 是防它将来改坏
+        [[ -n "$latest" ]] || latest=$(latest_tag || true)
         if [[ -z "$latest" ]]; then
             warn "查不到最新版本：本机连不上 GitHub（直连和镜像都试过了）"
             echo "  当前版本：${cur}，保持不动"
@@ -368,7 +412,7 @@ EOF
             printf '%s' "$DL_DIAG" >&2
             cat >&2 <<EOF
 
-  三行分别是直连和各镜像的失败原因。针对性处理：
+  下面每行是一条通道的失败原因（直连 + 各个镜像），针对性处理：
     · DNS 解析失败      → cat /etc/resolv.conf，换个能用 53 的 DNS
     · TLS 握手失败      → 多半系统时间不对：timedatectl status
     · 超时 / 连不上     → 机房封了 GitHub，换镜像：
@@ -488,19 +532,21 @@ if [[ "$DIAG" -eq 1 ]]; then
     exit 0
 fi
 
-# 1.19.34 起才有 snell v6（v6 是 PSK 派生的分片混淆层），旧版遇到
-# version: 6 会直接报 "snell version error"。
-MIHOMO_VERSION="${MIHOMO_VERSION:-1.19.34}"
-
 # 代理内核：出口粘 ss/vmess/vless/trojan/hysteria2/snell 等链接时用它落地。
 # 定义必须在这下面那个「装过就走升级」的分支之前 —— bash 是顺序执行的，
 # 定义在分支后面，升级路径里就调不到它。
+#
+# install_mihomo [upgrade]
+#   upgrade：已在用的机器上只做版本检查。没装就跳过 —— 只用 direct / socks5
+#            的人不该每次升级都被拖着下一个 22MB 的内核。
 install_mihomo() {
+    local mode="${1:-install}"
     if command -v mihomo >/dev/null 2>&1; then
         # 不能因为「文件存在」就跳过：老版本没有 snell v6，升级完 dotmux
         # 出口照样连不上，而错误只落在 mihomo.log 里，很难联想到内核版本。
         local cur=""
-        cur="$(mihomo -v 2>/dev/null | sed -n 's/.*[[:space:]]v\([0-9][0-9.]*\).*/\1/p' | head -1)"
+        # || true：`mihomo -v` 意外非零时，set -e 会让脚本在这里静默退出
+        cur="$(mihomo -v 2>/dev/null | sed -n 's/.*[[:space:]]v\([0-9][0-9.]*\).*/\1/p' | head -1 || true)"
         if [[ -z "$cur" ]]; then
             ok "mihomo 已存在（版本未知，跳过）：$(command -v mihomo)"
             return 0
@@ -510,6 +556,9 @@ install_mihomo() {
             return 0
         fi
         info "mihomo v${cur} 低于 v${MIHOMO_VERSION}，升级（snell v6 需要新版）"
+    elif [[ "$mode" == "upgrade" ]]; then
+        info "未安装 mihomo，跳过（只用 direct / socks5 时不需要它）"
+        return 0
     fi
     local arch
     case "$(uname -m)" in
@@ -542,7 +591,7 @@ if [[ -x "$BIN" && -f "$CONF" ]]; then
     upgrade_if_needed "$FORCE" || exit 1
     # 内核也得看。这一支以前只换 dotmux、从不碰 mihomo，于是「升级成功」
     # 但粘 snell v6 链接照样报 snell version error，而错误只在 mihomo.log 里。
-    install_mihomo
+    install_mihomo upgrade
     ensure_service_running || exit 1
     exit 0
 fi
@@ -699,6 +748,7 @@ if [[ -x "$(dirname "$0")/dotmux" ]]; then
     install -m 0755 "$(dirname "$0")/dotmux" "$BIN"
     ok "使用本地构建的二进制"
 elif [[ -n "${LOCAL_BIN:-}" ]]; then
+    [[ -s "$LOCAL_BIN" ]] || { err "LOCAL_BIN 指向的文件不存在或为空：$LOCAL_BIN"; exit 1; }
     install -m 0755 "$LOCAL_BIN" "$BIN"
     ok "使用本地二进制：$LOCAL_BIN"
 else
@@ -706,8 +756,14 @@ else
     # latest 为空时退回 /releases/latest/download 这条固定路径
     [[ -n "${LATEST:-}" ]] || URL="https://github.com/$REPO/releases/latest/download/dotmux-linux-$ARCH"
     if dl "$BIN.tmp" "$URL" 300; then
-        install -m 0755 "$BIN.tmp" "$BIN" && rm -f "$BIN.tmp"
-        ok "已下载 $ARCH 版本"
+        if install -m 0755 "$BIN.tmp" "$BIN"; then
+            rm -f "$BIN.tmp"
+            ok "已下载 $ARCH 版本"
+        else
+            rm -f "$BIN.tmp"
+            err "写入 $BIN 失败（磁盘满？）"
+            exit 1
+        fi
     else
         err "下载失败：本机连不到 GitHub"
         printf '%s' "$DL_DIAG" >&2
