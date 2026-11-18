@@ -44,7 +44,11 @@ type Config struct {
 	// 手机再查时直接命中，只有手机到网关这一次往返。
 	// 对外作答的 TTL 仍不超过上游原值，客户端的缓存行为不变。
 	CacheMinTTL uint32    `json:"cache_min_ttl"`
-	Log         LogConfig `json:"log"`
+	// LazyTTL 是缓存过期后的宽限期秒数（stale-while-revalidate）。
+	// 期间仍用旧答案立即应答、后台再刷新，避免用户等待跨境回源。
+	// 对齐 5GPN-X 的 lazy_cache_ttl；设 0 关闭该行为。
+	LazyTTL uint32    `json:"lazy_ttl"`
+	Log     LogConfig `json:"log"`
 	Rules       RulesConf `json:"rules"`
 	Telegram    TGConf    `json:"telegram"`
 	QUIC        QUICConf  `json:"quic"`
@@ -141,6 +145,7 @@ func defaultConfig() *Config {
 	c.CacheSize = 8192
 	c.SyntheticTTL = 60
 	c.CacheMinTTL = 600
+	c.LazyTTL = 300
 	c.Log.Level = "info"
 	c.Rules.RefreshHours = 24
 	c.Rules.CacheDir = "/var/lib/dotmux/rules"

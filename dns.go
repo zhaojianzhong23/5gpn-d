@@ -2,6 +2,7 @@ package main
 
 import (
 	"crypto/tls"
+	"errors"
 	"net"
 	"strings"
 	"sync"
@@ -11,9 +12,10 @@ import (
 )
 
 type dnsCache struct {
-	mu  sync.Mutex
-	m   map[string]cacheEntry
-	max int
+	mu       sync.Mutex
+	m        map[string]cacheEntry
+	max      int
+	lazyTTL  time.Duration // 过期后的宽限期：期间仍用旧答案秒回，后台刷新
 }
 
 type cacheEntry struct {
@@ -28,22 +30,40 @@ func newDNSCache(max int) *dnsCache {
 	return &dnsCache{m: make(map[string]cacheEntry), max: max}
 }
 
+// get 返回缓存应答（兼容旧调用点）。
 func (c *dnsCache) get(key string) *dns.Msg {
+	m, _ := c.getWithStale(key)
+	return m
+}
+
+// getWithStale 返回缓存应答；第二个返回值 true 表示这是过期后的「陈旧答案」。
+// 陈旧答案仍立即下发（用户不用等上游），调用方据此在后台刷新。
+func (c *dnsCache) getWithStale(key string) (*dns.Msg, bool) {
 	if c == nil || c.max == 0 {
-		return nil
+		return nil, false
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	e, ok := c.m[key]
-	if !ok || time.Now().After(e.exp) {
-		if ok {
-			delete(c.m, key)
-		}
-		return nil
+	if !ok {
+		return nil, false
 	}
+	now := time.Now()
+	if now.After(e.exp) {
+		// 超过宽限期才真正丢弃；在 lazyTTL 宽限期内继续用旧答案。
+		if c.lazyTTL <= 0 || now.After(e.exp.Add(c.lazyTTL)) {
+			delete(c.m, key)
+			return nil, false
+		}
+	}
+	stale := now.After(e.exp)
 	m := e.msg.Copy()
 	// 剩余存活时间，但不超过上游原本给的 TTL，避免让客户端缓存过久。
+	// 陈旧答案统一给很短的 TTL：用户秒回旧 IP，1 秒后后台刷新好再来问就是新的。
 	left := uint32(time.Until(e.exp).Seconds())
+	if stale {
+		left = 1
+	}
 	if left < 1 {
 		left = 1
 	}
@@ -55,7 +75,7 @@ func (c *dnsCache) get(key string) *dns.Msg {
 			h.Ttl = left
 		}
 	}
-	return m
+	return m, stale
 }
 
 // put 写入缓存。cacheFor 是网关侧的存活秒数，origTTL 是上游原 TTL，
@@ -86,19 +106,22 @@ type dnsSvc struct {
 	rules func() *RuleSet
 	dyn   *Dyn
 	nets  []*net.IPNet
-	cache *dnsCache
+	cache      *dnsCache
+	refreshing sync.Map // key -> struct{}，陈旧刷新的去重，避免缓存击穿
 	// 启动时确定，避免每包解析
 	gatewayV4 net.IP
 	ecs       net.IP
 }
 
 func newDNSSvc(cfg *Config, rules func() *RuleSet, dyn *Dyn) *dnsSvc {
+	cache := newDNSCache(cfg.CacheSize)
+	cache.lazyTTL = time.Duration(cfg.LazyTTL) * time.Second
 	return &dnsSvc{
 		cfg:       cfg,
 		rules:     rules,
 		dyn:       dyn,
 		nets:      cfg.ClientNets(),
-		cache:     newDNSCache(cfg.CacheSize),
+		cache:     cache,
 		gatewayV4: net.ParseIP(cfg.GatewayIP).To4(),
 		ecs:       net.ParseIP(cfg.ECS).To4(),
 	}
@@ -185,7 +208,11 @@ func attachEDNS(resp, req *dns.Msg) {
 
 func (s *dnsSvc) forward(w dns.ResponseWriter, req *dns.Msg, useECS bool) {
 	key := cacheKey(req)
-	if r := s.cache.get(key); r != nil {
+	if r, stale := s.cache.getWithStale(key); r != nil {
+		// 陈旧答案：用户秒回旧 IP，不等上游；后台去重刷新一次。
+		if stale {
+			s.refreshAsync(key, req, useECS)
+		}
 		r.Id = req.Id
 		_ = w.WriteMsg(r)
 		return
@@ -197,14 +224,64 @@ func (s *dnsSvc) forward(w dns.ResponseWriter, req *dns.Msg, useECS bool) {
 		s.replyEmpty(w, req, dns.RcodeServerFailure)
 		return
 	}
+	s.store(key, resp)
 	resp.Id = req.Id
+	_ = w.WriteMsg(resp)
+}
+
+// store 把上游应答按缓存策略写入（缓存里的 ID 在下发时会被覆盖）。
+func (s *dnsSvc) store(key string, resp *dns.Msg) {
 	ttl := minTTL(resp)
 	cacheFor := ttl
 	if f := s.cfg.CacheMinTTL; f > cacheFor {
 		cacheFor = f
 	}
 	s.cache.put(key, resp, cacheFor, ttl)
-	_ = w.WriteMsg(resp)
+}
+
+// refreshAsync 后台刷新陈旧缓存；同一 key 同时只允许一个刷新在跑，
+// 防止过期瞬间大量请求把上游打爆（缓存击穿）。
+func (s *dnsSvc) refreshAsync(key string, req *dns.Msg, useECS bool) {
+	if _, loaded := s.refreshing.LoadOrStore(key, struct{}{}); loaded {
+		return
+	}
+	go func() {
+		defer s.refreshing.Delete(key)
+		resp, err := s.exchange(req, useECS)
+		if err != nil {
+			return // 保留旧答案，下次再试
+		}
+		s.store(key, resp)
+	}()
+}
+
+// dnsRace 向一组上游并发发起同一查询，取第一个有效应答。
+// 单个上游抖动（丢包/跨境绕路）不再拖垮整次解析——这是 5GPN-X  mosdns
+// "China DNS race" 的做法：谁先回用谁，慢的那个结果丢弃即可。
+// 应答带上 TC（截断）时视为无效，交给上层走 TCP 阶段。
+func dnsRace(q *dns.Msg, ups []string, netw string, timeout time.Duration) *dns.Msg {
+	if len(ups) == 0 {
+		return nil
+	}
+	ch := make(chan *dns.Msg, len(ups))
+	for _, up := range ups {
+		up = dnsAddr(up)
+		go func(addr string) {
+			c := &dns.Client{Net: netw, Timeout: timeout}
+			resp, _, err := c.Exchange(q, addr)
+			if err != nil || resp == nil || resp.Truncated {
+				ch <- nil
+				return
+			}
+			ch <- resp
+		}(up)
+	}
+	for i := 0; i < len(ups); i++ {
+		if r := <-ch; r != nil {
+			return r
+		}
+	}
+	return nil
 }
 
 func (s *dnsSvc) exchange(req *dns.Msg, useECS bool) (*dns.Msg, error) {
@@ -216,24 +293,24 @@ func (s *dnsSvc) exchange(req *dns.Msg, useECS bool) (*dns.Msg, error) {
 	if useECS && s.ecs != nil {
 		q = withECS(req, s.ecs)
 	}
-	var lastErr error
-	for _, up := range local {
-		up = dnsAddr(up)
-		c := &dns.Client{Timeout: 3 * time.Second}
-		if resp, _, err := c.Exchange(q, up); err == nil {
-			return resp, nil
-		} else {
-			lastErr = err
-		}
-		// UDP 失败后用 TCP 再试一次（大响应 / 被截断）
-		ct := &dns.Client{Net: "tcp", Timeout: 3 * time.Second}
-		if resp, _, err := ct.Exchange(q, up); err == nil {
-			return resp, nil
-		} else {
-			lastErr = err
-		}
+
+	// 第一段：UDP 并发竞速，150ms 内谁先回用谁（对齐 mosdns threshold）。
+	if resp := dnsRace(q, local, "udp", 150*time.Millisecond); resp != nil {
+		return resp, nil
 	}
-	return nil, lastErr
+	// 第二段：UDP 全挂（丢包/大响应被截断），TCP 并发再竞速。
+	if resp := dnsRace(q, local, "tcp", 800*time.Millisecond); resp != nil {
+		return resp, nil
+	}
+	// 第三段：国内 DNS 彻底不可达，用海外 DNS 兜底，至少不给 SERVFAIL。
+	remote, _ := s.dyn.DNS()
+	if len(remote) == 0 {
+		remote = s.cfg.RemoteDNS
+	}
+	if resp := dnsRace(req, remote, "udp", 800*time.Millisecond); resp != nil {
+		return resp, nil
+	}
+	return nil, errors.New("所有上游 DNS 均不可用")
 }
 
 // withECS 给查询附加 EDNS Client Subnet。
