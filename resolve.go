@@ -148,8 +148,13 @@ func (c *resolveCache) Lookup(upstreams []string, host string) (net.IP, error) {
 	if len(ips) > 0 {
 		ip = ips[0]
 	}
-	close(f.done)
+	// 必须先写结果，再 close(done)。close 与 <-done 之间是 happens-before，
+	// 等待者由此 guaranteed 看到这里写入的值。反过来（先 close 后写）会让
+	// 等待者在 close 之后、赋值之前被唤醒，读到零值 f.ip=nil / f.err=nil，
+	// 进而拿 "<nil>:443" 去拨号——并发刷新时一批连接全失败，串行或缓存命中
+	// 时正常，正是「第一次能进、刷新就挂、清缓存/过一会又能进」的根因。
 	f.ip, f.err = ip, err
+	close(f.done)
 	return ip, err
 }
 
