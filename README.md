@@ -63,7 +63,7 @@ sudo DOMAIN=dot.example.com EMAIL=you@example.com CLIENT_CIDR=172.22.0.0/16 \
 | 项 | 默认 | 想改就传环境变量 |
 |---|---|---|
 | 客户端网段 | `172.22.0.0/16`（填单个 IP 也可，按 /32） | `CLIENT_CIDR=10.8.0.0/24` |
-| QUIC 中继 | 关（浏览器回落 TCP，分流照旧） | `QUIC_ENABLED=1` 打开 |
+| QUIC 中继 | 关（浏览器回落 TCP，分流照旧） | `QUIC_ENABLED=1` 打开，或装好后在 Bot「系统管理」里热开关 |
 | 网关地址 | 自动探测：先找本机同段地址，找不到用公网 IP | `GATEWAY_IP=172.22.1.10` |
 | 出口 | 只有 `local` 直连 | `SOCKS5=user:pass@host:port` |
 
@@ -240,7 +240,7 @@ FINAL,proxy
 | 📊 状态 | DoT / SNI / QUIC 健康、iOS 描述文件、Bot 自身；当前出口、域名、分流开关、规则数、FINAL；运行时长、CPU 与 load、内存 / Swap、证书剩余天数 |
 | 🌐 出口管理 | 当前出口与出口 IP（含建连 / TLS / 合计三段耗时，测的是本机经该出口到 api.ipify.org，不是手机到本机的延迟）；点名字切换默认出口；添加（`名字 socks5://…` 或直接粘 `名字 ss://…` / `vmess://…` 等分享链接）、重命名（规则里的引用一起改）、删除、并发探测所有出口 |
 | 📋 分流管理 | 规则列表、规则集列表、规则设置；添加 / 删除本地规则；添加远程规则集（先选格式：自动 / clash / gfwlist / 纯域名 / dnsmasq，再选动作：走代理 / 直接连）；分类→出口映射；立即更新规则；一键开关分流 |
-| 🛠 系统管理 | 改域名（证书路径同步改）、改国际 / 国内 DNS、续期证书（certbot，异步回执）、重启服务、看最近日志 |
+| 🛠 系统管理 | 改域名（证书路径同步改）、改国际 / 国内 DNS、续期证书（certbot，异步回执）、QUIC 中继热开关（不用重启，页面直接显示开/关）、重启服务、看最近日志 |
 | 📱 iOS 二维码 | 把 `profile_url` 生成二维码，手机扫码即装 |
 
 命令：`/menu` `/status` `/exits` `/rules` `/manage` `/id` `/cancel`。输入 `名字 socks5://...` 这类多步操作时，机器人会先问再记，`/cancel` 随时退出。
@@ -265,6 +265,8 @@ FINAL,proxy
 **QUIC 与 TCP 走同一个出口。** 规则判成 `proxy` 时，QUIC 通过 SOCKS5 UDP ASSOCIATE 让代理端解析域名并转发，源 IP 与 TCP 一致；代理不可用时直接丢弃，**不会悄悄回退成本机出口**——那等于把手机卡 IP 露出去。
 
 UDP 关联的代价：每个 QUIC 会话要额外占一条到代理的 TCP 控制连接（关掉即失效）。节点不支持 UDP 转发时（部分 ss/vmess 服务端没开 `udp`），QUIC 会连不上，浏览器随即回退 TCP，走 SNI 通道，不影响访问。
+
+**运行时开关：** Bot →「🛠 系统管理」→「⚡ QUIC：关 → 开」，切换立即生效，并写回 `config.json` 的 `quic.enabled`（只改这一个字段，`listen` / `idle_sec` / `udp_direct` 原样保留）。热开关只动 UDP 443，正在跑的 TCP 和 DoT 会话一条都不会断——这正是它值得做成热开关的原因，改配置重启服务的代价太大。
 
 想让 QUIC 一律从网关本机发出（例如代理不支持 UDP，或你就想让它走手机卡），设 `quic.udp_direct: true`。
 

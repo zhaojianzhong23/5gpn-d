@@ -23,9 +23,13 @@ type tgDeps struct {
 	RulesFile   string
 	Started     time.Time
 	Health      func() map[string]bool
-	QUICOn      bool
-	CertPath    string
-	ProfileURL  func() string
+	// QUICOn 每次现查中继是否在跑。不能用启动时的快照：开关是热的，
+	// 页面上的绿点和按钮文字都得跟着变。
+	QUICOn func() bool
+	// QUICSet 热启停 QUIC 中继并写回配置，nil 表示此版本不支持。
+	QUICSet    func(bool) error
+	CertPath   string
+	ProfileURL func() string
 	// Proxy 是代理内核管理器，用于显示 mihomo 出口是否在运行
 	Proxy *mihomoMgr
 }

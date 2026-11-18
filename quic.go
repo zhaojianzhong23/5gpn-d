@@ -37,6 +37,9 @@ type quicRelay struct {
 	lens   sync.Map // 连接 ID 长度 -> struct{}，短头包按长度逐个试
 	closed atomic.Bool
 
+	// done 用来叫停 gc 循环。只 close 一次，Close 里做了 Swap 保护。
+	done chan struct{}
+
 	// live 是当前会话数。每条会话占一个出站 UDP socket，也就是一个 fd；
 	// 没有上限的话，一个跑疯了的客户端（或异常重连风暴）就能把 fd 吃干净，
 	// 连 TCP 转发和 DoT 都分不到 socket。上限和 TCP 那道闸门是一个道理。
@@ -152,14 +155,14 @@ func cidKey(addr *net.UDPAddr, cid []byte) string {
 	return addr.String() + "#" + string(cid)
 }
 
-func startQUIC(cfg *Config, rules func() *RuleSet, dyn *Dyn) error {
+func startQUIC(cfg *Config, rules func() *RuleSet, dyn *Dyn) (*quicRelay, error) {
 	addr, err := net.ResolveUDPAddr("udp", cfg.QUIC.Listen)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	conn, err := net.ListenUDP("udp", addr)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	r := &quicRelay{
 		conn:  conn,
@@ -170,11 +173,30 @@ func startQUIC(cfg *Config, rules func() *RuleSet, dyn *Dyn) error {
 		idle:  time.Duration(cfg.QUIC.IdleSec) * time.Second,
 		port:  443,
 		addrs: make(map[string]quicAddr),
+		done:  make(chan struct{}),
 	}
 	go r.run()
 	go r.gc()
 	logf("info", "QUIC 中继监听 %s/udp", cfg.QUIC.Listen)
-	return nil
+	return r, nil
+}
+
+// Close 停掉中继：关监听、断掉所有会话，再让 run/gc 两个循环退出。
+//
+// 会话必须逐个关：每条会话占着一个出站 UDP socket，光关监听只是不再收新包，
+// 存量 socket 会一直挂在那儿，开关来回点几次就把 fd 耗光。
+func (r *quicRelay) Close() error {
+	if r.closed.Swap(true) {
+		return nil
+	}
+	if r.done != nil {
+		close(r.done)
+	}
+	r.sess.Range(func(_, v any) bool {
+		v.(*quicSession).close()
+		return true
+	})
+	return r.conn.Close()
 }
 
 func (r *quicRelay) run() {
@@ -439,7 +461,12 @@ func (r *quicRelay) pumpBack(s *quicSession) {
 func (r *quicRelay) gc() {
 	t := time.NewTicker(5 * time.Second)
 	defer t.Stop()
-	for range t.C {
+	for {
+		select {
+		case <-r.done:
+			return
+		case <-t.C:
+		}
 		now := time.Now().Unix()
 		limit := int64(r.idle.Seconds())
 		r.sess.Range(func(_, v any) bool {

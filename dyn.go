@@ -416,6 +416,18 @@ func (d *Dyn) SetDomain(domain string) error {
 	return d.save(patch)
 }
 
+// SetQUICEnabled 只改 quic.enabled，listen / idle_sec / udp_direct 原样保留。
+func (d *Dyn) SetQUICEnabled(on bool) error {
+	return d.saveMutate(func(m map[string]any) {
+		q, ok := m["quic"].(map[string]any)
+		if !ok {
+			q = map[string]any{}
+		}
+		q["enabled"] = on
+		m["quic"] = q
+	})
+}
+
 func stripPort(in []string) []string {
 	out := make([]string, 0, len(in))
 	for _, s := range in {
@@ -472,6 +484,19 @@ func (d *Dyn) saveSources() error {
 
 // save 只改指定字段，其余 JSON 内容原样保留，并留一份 .bak。
 func (d *Dyn) save(patch map[string]any) error {
+	return d.saveMutate(func(m map[string]any) {
+		for k, v := range patch {
+			m[k] = v
+		}
+	})
+}
+
+// saveMutate 读配置、交给 mutate 改、再原子写回，并留一份 .bak。
+//
+// 改嵌套字段（比如 quic.enabled）必须走这个：save 是整块替换顶层键，
+// 拿 map[string]any{"quic": ...} 去 patch 会把同一个对象下的
+// listen / idle_sec / udp_direct 一起抹掉。
+func (d *Dyn) saveMutate(mutate func(map[string]any)) error {
 	d.mu.Lock()
 	path := d.path
 	d.mu.Unlock()
@@ -486,9 +511,7 @@ func (d *Dyn) save(patch map[string]any) error {
 	if err := json.Unmarshal(raw, &m); err != nil {
 		return fmt.Errorf("运行时已生效，但配置解析失败: %w", err)
 	}
-	for k, v := range patch {
-		m[k] = v
-	}
+	mutate(m)
 	out, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
 		return err

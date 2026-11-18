@@ -86,7 +86,7 @@
     "profile_url": ""
   },
   "quic": {
-    "enabled": true,
+    "enabled": false,
     "listen": ":443",
     "idle_sec": 30,
     "udp_direct": false

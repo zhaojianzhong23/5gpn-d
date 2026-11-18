@@ -90,6 +90,12 @@ func (b *tgBot) renderMain() (string, *tgKeyboard) {
 	}}
 }
 
+// quicOn 读当前 QUIC 中继状态。deps.QUICOn 为 nil 时（测试里构造的精简 bot）
+// 当作没开，别让页面因为一个空回调整个挂掉。
+func (b *tgBot) quicOn() bool {
+	return b.deps.QUICOn != nil && b.deps.QUICOn()
+}
+
 func onOff(v bool) string {
 	if v {
 		return "开启"
@@ -130,7 +136,7 @@ func (b *tgBot) renderStatus() (string, *tgKeyboard) {
 	sb.WriteString("📊 运行状态\n\n")
 	sb.WriteString(fmt.Sprintf("%s DoT     %s\n", mark(health["dot"]), b.cfg.Listen.DoT))
 	sb.WriteString(fmt.Sprintf("%s SNI 转发 %s / %s\n", mark(health["sni"]), b.cfg.Listen.TLS, b.cfg.Listen.HTTP))
-	if b.deps.QUICOn {
+	if b.quicOn() {
 		via := "随分流走代理"
 		if b.cfg.QUIC.UDPDirect {
 			via = "本机直连"
@@ -447,19 +453,40 @@ func (b *tgBot) renderManage() (string, *tgKeyboard) {
 		certLine = fmt.Sprintf("剩余 %d 天（到期 %s）",
 			certDaysLeft(ci.NotAfter), ci.NotAfter.Format("2006-01-02"))
 	}
+	quicLine := "关（不监听 UDP 443，HTTP/3 站点自动回落 TCP）"
+	if b.quicOn() {
+		quicLine = fmt.Sprintf("开（%s/udp，%s）", b.cfg.QUIC.Listen, quicVia(b.cfg))
+	}
 	text := fmt.Sprintf("🛠 系统管理\n\n"+
 		"🌐 当前域名：%s\n"+
 		"🌏 国际 DNS：%s\n"+
 		"🇨🇳 国内 DNS：%s\n"+
-		"🔐 证书：%s\n",
-		dom, strings.Join(stripPort(remote), "  "), strings.Join(stripPort(local), "  "), certLine)
+		"🔐 证书：%s\n"+
+		"⚡ QUIC 中继：%s\n"+
+		"   单入口下多标签并发 H3 会串流，表现是「第一次能开、刷新白屏」；\n"+
+		"   碰到就关掉，浏览器立刻回落 TCP，分流不受影响。开关热生效，无需重启。\n",
+		dom, strings.Join(stripPort(remote), "  "), strings.Join(stripPort(local), "  "), certLine, quicLine)
+
+	quicBtn := "⚡ QUIC：关 → 开"
+	if b.quicOn() {
+		quicBtn = "⚡ QUIC：开 → 关"
+	}
 
 	return text, &tgKeyboard{InlineKeyboard: [][]tgButton{
 		{{Text: "🌐 更改域名", CallbackData: "g:domain"}, {Text: "🌏 更改国际 DNS", CallbackData: "g:rdns"}},
 		{{Text: "🇨🇳 更改国内 DNS", CallbackData: "g:ldns"}, {Text: "🔐 续期证书", CallbackData: "g:renew"}},
-		{{Text: "♻️ 重启服务", CallbackData: "g:restart"}, {Text: "📜 日志", CallbackData: "g:log"}},
+		{{Text: quicBtn, CallbackData: "g:quic"}, {Text: "📜 日志", CallbackData: "g:log"}},
+		{{Text: "♻️ 重启服务", CallbackData: "g:restart"}},
 		{{Text: "« 返回", CallbackData: "m"}},
 	}}
+}
+
+// quicVia 说明 QUIC 包走哪条路出去，和状态页保持同一套说法。
+func quicVia(cfg *Config) string {
+	if cfg.QUIC.UDPDirect {
+		return "本机直连"
+	}
+	return "随分流走代理"
 }
 
 func helpText() string {
@@ -467,7 +494,7 @@ func helpText() string {
 		"📊 状态 —— 组件健康、负载、内存、证书\n" +
 		"🌐 出口管理 —— 切换 / 添加 / 删除 / 探测出口\n" +
 		"📋 分流管理 —— 规则、规则集、分类到出口的映射\n" +
-		"🛠 系统管理 —— 域名、DNS、证书、重启、日志\n" +
+		"🛠 系统管理 —— 域名、DNS、证书、QUIC 热开关、重启、日志\n" +
 		"📱 iOS 二维码 —— 手机扫码装描述文件（QR 页在 /menu）\n\n" +
 		"规则格式（/etc/dotmux/rules.conf）：\n" +
 		"DOMAIN,example.com,direct\n" +
@@ -729,6 +756,20 @@ func (b *tgBot) onCallback(chatID, msgID int64, data string) {
 			}
 			b.sendMessage(chatID, msg, backOnly())
 		}()
+	case data == "g:quic":
+		if b.deps.QUICSet == nil {
+			b.editMessage(chatID, msgID, "❌ 此版本不支持热开关，改 config.json 后重启", backOnly())
+			return
+		}
+		want := !b.quicOn()
+		if err := b.deps.QUICSet(want); err != nil {
+			b.editMessage(chatID, msgID, "❌ QUIC 开关失败："+err.Error(), backOnly(
+				[]tgButton{{Text: "« 返回", CallbackData: "g"}}))
+			return
+		}
+		// 直接重绘管理页，按钮文字和状态行一起跟着变，不用退回再进来一次。
+		text, kb := b.renderManage()
+		b.editMessage(chatID, msgID, text, kb)
 	case data == "g:restart":
 		b.editMessage(chatID, msgID, "♻️ 正在重启 dotmux，稍后 Bot 会重新上线…", backOnly())
 		if err := RestartService(); err != nil {

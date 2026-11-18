@@ -197,15 +197,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	health := map[string]bool{"dot": true, "sni": false, "quic": false}
 	if err := startSNI(cfg, holder.get, dyn); err != nil {
 		logf("error", "SNI 转发启动失败: %v（后台会持续重试）", err)
 	}
+
+	// QUIC 走管理器而不是直接 startQUIC：Bot 里要能热开关，
+	// 改完配置重启服务会把 TCP 和 DoT 全断一遍，代价太大。
+	qm := newQUICMgr(cfg, holder.get, dyn)
 	if cfg.QUIC.Enabled {
-		if err := startQUIC(cfg, holder.get, dyn); err != nil {
+		if err := qm.Start(); err != nil {
 			logf("warn", "QUIC 中继启动失败: %v", err)
-		} else {
-			health["quic"] = true
 		}
 	}
 
@@ -215,11 +216,12 @@ func main() {
 		Rules:   holder.get,
 		Started: started,
 		Health: func() map[string]bool {
-			// sni 每次现查监听状态，不再用启动时的快照——
+			// sni/quic 每次现查真实状态，不再用启动时的快照——
 			// 之前 443 已经死了，Bot 还显示绿色。
-			return map[string]bool{"dot": true, "sni": sniAlive(), "quic": health["quic"]}
+			return map[string]bool{"dot": true, "sni": sniAlive(), "quic": qm.Running()}
 		},
-		QUICOn:    cfg.QUIC.Enabled,
+		QUICOn:    qm.Running,
+		QUICSet:   qm.Set,
 		Proxy:     mgr,
 		CertPath:  cfg.CertFile,
 		RulesFile: cfg.RulesFile,
