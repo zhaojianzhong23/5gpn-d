@@ -379,8 +379,10 @@ func (r *quicRelay) resolveCached(host string) (net.IP, error) {
 		return nil, err
 	}
 	r.addrMu.Lock()
-	if len(r.addrs) >= 4096 {
-		// 简单防膨胀：满了就换张新表。这里存的是纯数据，清掉只是下次多解析一次。
+	// 惰性初始化：startQUIC 会建好这张表，但 relay 也可能被直接构造
+	//（测试、将来的单次转发），往 nil map 里写会直接 panic。
+	if r.addrs == nil || len(r.addrs) >= 4096 {
+		// 满了就换张新表。这里存的是纯数据，清掉只是下次多解析一次。
 		r.addrs = make(map[string]quicAddr)
 	}
 	r.addrs[host] = quicAddr{ip: ip, exp: time.Now().Add(time.Minute)}
