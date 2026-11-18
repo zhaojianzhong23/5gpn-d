@@ -141,6 +141,13 @@ if [[ -d $STATE_DIR ]]; then
     rm -rf "$STATE_DIR" && ok "已删除 $STATE_DIR"
 fi
 
+# 安装时写进去的 BBR / 缓冲调优，留着会让宿主机悄悄保持这套参数
+NET_TUNE=/etc/sysctl.d/99-dotmux-net.conf
+if [[ -f $NET_TUNE ]]; then
+    rm -f "$NET_TUNE" && ok "已删除 $NET_TUNE（BBR 等网络参数，重启后回到系统默认）"
+    info "想立刻恢复默认：sysctl --system"
+fi
+
 if command -v systemctl >/dev/null 2>&1; then
     systemctl daemon-reload 2>/dev/null
     systemctl reset-failed dotmux 2>/dev/null

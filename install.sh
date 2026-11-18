@@ -256,6 +256,15 @@ diag() {
     fi
     printf '  dotmux      : %s\n' "${dv:-未安装}"
     printf '  mihomo      : %s（要求 ≥ %s）\n' "${mv:-未安装}" "${MIHOMO_VERSION}"
+    # 视频卡顿先看这里：cubic 在丢包的跨境链路上会把窗口砍到很低
+    local cc qd
+    cc=$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || true)
+    qd=$(cat /proc/sys/net/core/default_qdisc 2>/dev/null || true)
+    if [[ "$cc" == "bbr" ]]; then
+        printf '  拥塞控制    : %s / %s\n' "$cc" "${qd:-未知}"
+    else
+        printf '  拥塞控制    : %s / %s ← 不是 bbr，重跑本脚本会自动配好\n' "${cc:-未知}" "${qd:-未知}"
+    fi
 
     echo
     echo "连通性："
@@ -586,12 +595,80 @@ install_mihomo() {
     fi
 }
 
+# ---------- 整机网络调优 ----------
+# 跨境链路上丢包是常态。默认的 cubic 把丢包当拥塞信号，窗口一砍到底，
+# 表现就是「视频看着看着掉清晰度、一直转圈」。BBR 按带宽时延积估速率，
+# 丢几个包不影响吞吐——这是这类机器上最划算的一处改动。
+#
+# rmem/wmem 放大是给 QUIC 中继用的：它用一个 UDP socket 收所有 H3 流量，
+# 默认 200KB 上下的接收缓冲在码率冲高那一瞬间就溢出，内核直接把包丢了。
+tune_network() {
+    local conf=/etc/sysctl.d/99-dotmux-net.conf
+    local body cc="" have_bbr=0 now=""
+    STEP="整机网络调优"
+
+    if [[ ! -d /etc/sysctl.d ]] || ! command -v sysctl >/dev/null 2>&1; then
+        warn "没有 sysctl.d 或 sysctl，跳过整机网络调优"
+        return 0
+    fi
+
+    # 老内核里 bbr 是模块，先试装进来；装不上就保持默认拥塞控制
+    modprobe tcp_bbr >/dev/null 2>&1 || true
+    if grep -qw bbr /proc/sys/net/ipv4/tcp_available_congestion_control 2>/dev/null; then
+        have_bbr=1
+        cc="net.ipv4.tcp_congestion_control=bbr"
+    fi
+
+    body="$(cat <<EOF
+# 由 dotmux 安装脚本生成，卸载时删除
+net.core.default_qdisc=fq
+${cc}
+net.ipv4.tcp_fastopen=3
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_tw_reuse=1
+net.core.somaxconn=8192
+net.ipv4.tcp_max_syn_backlog=8192
+net.core.netdev_max_backlog=16384
+net.core.rmem_max=16777216
+net.core.wmem_max=16777216
+net.ipv4.tcp_rmem=4096 87380 16777216
+net.ipv4.tcp_wmem=4096 65536 16777216
+EOF
+)"
+
+    if [[ -f "$conf" ]] && [[ "$(cat "$conf" 2>/dev/null)" == "$body" ]]; then
+        if [[ "$have_bbr" -eq 1 ]]; then
+            ok "整机网络参数已是最新（BBR 已开）"
+        else
+            ok "整机网络参数已是最新（内核无 BBR）"
+        fi
+        return 0
+    fi
+    if ! printf '%s\n' "$body" > "$conf"; then
+        warn "写 $conf 失败，跳过整机网络调优"
+        return 0
+    fi
+    # 只应用这一个文件：sysctl --system 会把宿主机其它调优一起重放
+    sysctl -q -p "$conf" >/dev/null 2>&1 || warn "应用网络参数失败，重启后会自动生效"
+    now="$(cat /proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || true)"
+    if [[ "$have_bbr" -eq 1 && "$now" == "bbr" ]]; then
+        ok "TCP 拥塞控制 bbr + fq，socket 缓冲上限 16MB"
+    elif [[ "$have_bbr" -eq 0 ]]; then
+        warn "内核没有 BBR（$(uname -r)），已调大缓冲，拥塞控制保持默认"
+    else
+        ok "网络参数已写入 $conf（当前拥塞控制：${now:-未知}）"
+    fi
+}
+
 # 装过就只做升级检查，不再重复装依赖、签证书
 if [[ -x "$BIN" && -f "$CONF" ]]; then
     upgrade_if_needed "$FORCE" || exit 1
     # 内核也得看。这一支以前只换 dotmux、从不碰 mihomo，于是「升级成功」
     # 但粘 snell v6 链接照样报 snell version error，而错误只在 mihomo.log 里。
     install_mihomo upgrade
+    # 已装机器也要补上 BBR/缓冲：视频卡顿的大头在链路上，不在程序里
+    tune_network
     ensure_service_running || exit 1
     exit 0
 fi
@@ -886,6 +963,9 @@ FINAL,proxy
 EOF
     ok "已写入示例规则 $RULES（按需修改）"
 fi
+
+# 首次安装也走一遍：BBR 和 socket 缓冲是视频流畅度的前提
+tune_network
 
 # ---------- 服务 ----------
 STEP="注册并启动服务"

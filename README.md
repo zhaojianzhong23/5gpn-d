@@ -360,6 +360,55 @@ bash scripts/make-profile.sh dot.example.com 203.0.113.10 > dotmux.mobileconfig
 
 真正想让国内域名**完全不经过网关**，只有客户端分流一条路（AdGuard、RethinkDNS、sing-box 这类按规则选上游的 App），代价是多装一个常驻 App。不装 App 就没有这个选项，这是私人 DNS 的机制决定的，不是脚本能绕开的。
 
+## 短视频卡顿（TikTok / Shorts）
+
+封面能出、进得去，但视频一直转圈——这类问题基本不是带宽不够。按出现频率排：
+
+**1）每条连接都跨境查一次 DNS。** SNI 转发必须先知道域名对应哪个 IP 才能连出去，
+而旧版在同一次处理里查了两次：一次判「这个域名会不会指回网关自己」，一次真去建连。
+TikTok 打开一屏会并发开出几十条连接（API、封面、视频分片、埋点各建各的），
+等于每条都先排一个跨境 RTT。现在解析结果带 60 秒缓存并做了单飞（同一域名只有
+一条真的去查），而且**走代理出口的连接完全不做本地解析**——域名原样交给出口端，
+既少一次查询，也避免本地解析结果和出口所在地不一致。
+
+**2）规则漏了域名，分片 CDN 直连出去。** TikTok 的流量散在十几个域名家族上：
+`tiktokv.com`（API）、`tiktokcdn.com` / `tiktokcdn-us.com` / `ttlivecdn.com`（视频）、
+`byteoversea.com` / `ibytedtos.com`（后端）、`ibyteimg.com` / `muscdn.com`（图片）。
+远端表只要漏掉其中一个，那条流量就会直连出去被 RST，客户端反复重试。
+现在内置了一份兜底：**规则里没人提到这些家族时**自动按 proxy 处理；
+你显式写了 `direct` 的不会被覆盖。刻意没收 `bytedance.com` / `pstatp.com` /
+`snssdk.com`——它们同时服务国内抖音和头条，一刀切会把国内流量也绕一圈。
+
+**3）拥塞控制还是 cubic。** 跨境链路丢包是常态，cubic 把丢包当拥塞信号，
+窗口一砍到底，画面就掉清晰度。安装脚本现在会写 `/etc/sysctl.d/99-dotmux-net.conf`：
+BBR + fq、socket 缓冲上限 16MB（QUIC 中继是一个 UDP socket 收所有 H3 流量，
+默认 200KB 的接收缓冲在码率冲高那一瞬间就溢出丢包）、`tcp_fastopen=3`、
+`tcp_slow_start_after_idle=0`。升级时也会补做，不用重装。
+
+**4）出口 IP 被当机房、或者节点绕路。** 这一条改代码解决不了。TikTok 对机房 IP
+有额外风控，同样的线路，原生 IP 的落地就是比机房 IP 顺畅。先在 Bot「出口管理」
+里点探测看耗时，再用同一个出口跑一次下载对比：
+
+```bash
+# 在 VPS 上，把端口换成 Bot 里显示的本地 socks 端口
+curl -o /dev/null -w 'dns %{time_namelookup}  ttfb %{time_starttransfer}  total %{time_total}  速度 %{speed_download} B/s\n' \
+  -x socks5h://127.0.0.1:20000 https://www.tiktok.com/
+```
+
+`ttfb` 高、速度低，就是线路或落地的问题，换出口比调参数有用。
+
+**另外一条容易被忽略的：HTTP/3 的回落速度。** QUIC 中继关着时（默认），
+如果防火墙对 `443/udp` 是**静默丢弃**而不是拒绝，客户端会先试 HTTP/3，
+等超时才回落 TCP——首屏就慢好几秒。用 ufw 的话给它一个明确的拒绝：
+
+```bash
+ufw reject 443/udp     # 不开 QUIC 中继时
+# 开了 QUIC 中继则是： ufw allow 443/udp
+```
+
+云厂商安全组只能整条放行或拒绝，没法回 ICMP，那种情况下把
+`quic.enabled` 打开、让中继自己接管 UDP 443，反而回落得更快。
+
 ## 已知限制
 
 - **QUIC 中继默认关，且每个客户端同时只能服务一条连接**：报文加密后连接 ID 会被换成读不到的新值，单入口没法可靠区分同一 NAT 后面的多条 H3 连接（详见上文）。
