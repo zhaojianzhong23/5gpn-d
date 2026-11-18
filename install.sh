@@ -174,11 +174,12 @@ CLIENT_CIDR="${CLIENT_CIDR:-}"
 SOCKS5="${SOCKS5:-}"
 TG_TOKEN="${TG_TOKEN:-}"
 TG_ADMINS="${TG_ADMINS:-}"
-# QUIC 中继默认关：同一客户端从同一个源端口会并发开多条 H3 连接，
-# 单入口按 SNI 只能稳住一条，多开会串流（表现为“第一次能进、刷新就挂”）。
-# 关掉后浏览器对托管域名直接回落 TCP，SNI 通道照常分流。要开就 QUIC_ENABLED=1，
-# 或者装好之后在 Bot「系统管理」里热开关（不用重启，随时能关回去）。
-QUIC_ENABLED="${QUIC_ENABLED:-0}"
+# QUIC 中继默认开：TikTok/YouTube 等视频在 TCP 首访后被服务端 alt-svc:h3
+# 告知支持 HTTP/3，App 会切到 UDP/443。若中继关着，UDP 443 无人应答，
+# 视频卡在 QUIC 握手超时（表现为"列表能刷、看几个视频就卡住"）。
+# quic.go 已按连接 ID 分流，解决了同一 NAT 多开 H3 串流的问题。
+# 要关就 QUIC_ENABLED=0，或装好后到 Bot「系统管理」里热开关（随时能关回去）。
+QUIC_ENABLED="${QUIC_ENABLED:-1}"
 
 # ---------- 安装 or 升级 ----------
 # 不单独提供 upgrade 命令：跑同一个脚本，装过就只查版本、换二进制、重启。
