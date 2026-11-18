@@ -47,6 +47,7 @@ func ParseProxyURI(raw string) (ProxyNode, error) {
 		{"hy2://", parseHysteria2},
 		{"tuic://", parseTUIC},
 		{"anytls://", parseAnyTLS},
+		{"snell://", parseSnell},
 		{"naive+https://", parseNaive},
 		{"naive+http://", parseNaive},
 		{"naive+quic://", parseNaive},
@@ -72,7 +73,7 @@ func ParseProxyURI(raw string) (ProxyNode, error) {
 			return n, nil
 		}
 	}
-	return nil, fmt.Errorf("不支持的链接类型（支持 ss/vmess/vless/trojan/hysteria2/tuic/anytls/naive/socks5/http）")
+	return nil, fmt.Errorf("不支持的链接类型（支持 ss/vmess/vless/trojan/hysteria2/tuic/anytls/snell/naive/socks5/http）")
 }
 
 // b64Any 尝试几种常见 base64 变体，兼容没补 padding 的分享链接。
@@ -667,6 +668,128 @@ func parseNaive(uri string) (ProxyNode, error) {
 	return n, nil
 }
 
+// parseSnell 解析 snell://<psk>@<host>:<port>?version=6&mode=default
+//
+// Snell 是 Surge 的私有协议，没有官方 URI 规范，这里按社区通行写法收：
+//
+//	snell://psk@host:443?version=4&obfs=http&obfs-host=bing.com
+//	snell://host:443?psk=...        （psk 也可以只放 query）
+//
+// 版本对齐 mihomo 的 snell 出站（v1.19.34 起支持 1–6）：
+//   - v5 服务端向后兼容 v4 客户端，mihomo 内部收到 5 也会改按 4 连，
+//     这里提前归一，免得日志写着 v5 实际走的是 v4；
+//   - v6 是 PSK 派生的分片混淆层，和老的 simple-obfs 互斥。
+//
+// v6 的三条硬约束 mihomo 会在 NewSnell 里直接拒，这里提前给中文错误，
+// 否则只能看到 "snell version error" 或者连接超时。
+func parseSnell(uri string) (ProxyNode, error) {
+	rest := strings.TrimPrefix(uri, "snell://")
+	if i := strings.IndexByte(rest, '#'); i >= 0 {
+		rest = rest[:i]
+	}
+	body, query := rest, ""
+	if i := strings.IndexByte(rest, '?'); i >= 0 {
+		body, query = rest[:i], rest[i+1:]
+	}
+	q, qerr := url.ParseQuery(query)
+	if qerr != nil {
+		q = url.Values{}
+	}
+
+	// PSK 是随机串，机场复制出来不一定做 percent 转义，按最后一个 @ 切比
+	// url.Parse 稳：后者遇到未转义的 @ / # / ? 会直接把 host 解析错。
+	var psk, hostport string
+	if at := strings.LastIndexByte(body, '@'); at >= 0 {
+		psk, hostport = body[:at], body[at+1:]
+		if un, err := url.PathUnescape(psk); err == nil {
+			psk = un
+		}
+	} else {
+		hostport = body
+		psk = qget(q, "psk", "password", "key")
+	}
+	if psk == "" {
+		return nil, fmt.Errorf("snell 链接缺少 PSK：应形如 snell://<psk>@<host>:<port>?version=4")
+	}
+
+	host, port, err := splitHostPort(hostport, 443)
+	if err != nil {
+		return nil, err
+	}
+	if host, err = needHost(host); err != nil {
+		return nil, err
+	}
+
+	ver := 4
+	if s := qget(q, "version", "v"); s != "" {
+		p, cerr := strconv.Atoi(strings.TrimSpace(s))
+		if cerr != nil {
+			return nil, fmt.Errorf("snell 版本不合法: %s", s)
+		}
+		ver = p
+	}
+	if ver < 1 || ver > 6 {
+		return nil, fmt.Errorf("snell 版本 %d 不支持（mihomo 只认 v1–v6）", ver)
+	}
+	if ver == 5 {
+		// 服务端 v5 兼容 v4 客户端；归一后 udp / reuse 的判定也跟 v4 一致。
+		ver = 4
+	}
+
+	n := ProxyNode{"type": "snell", "server": host, "port": port, "psk": psk, "version": ver}
+
+	if ver == 6 {
+		if len(psk) < 12 || len(psk) > 255 {
+			return nil, fmt.Errorf("snell v6 的 PSK 要求 12–255 字节，当前 %d 字节", len(psk))
+		}
+		switch mode := strings.ToLower(strings.TrimSpace(qget(q, "mode"))); mode {
+		case "", "default":
+		case "unshaped", "unsafe-raw":
+			n["mode"] = mode
+		default:
+			return nil, fmt.Errorf("snell v6 的 mode 只能是 default / unshaped / unsafe-raw，收到 %q", mode)
+		}
+	}
+
+	// 老混淆层。v6 已经用 PSK 做流量整形，再叠 obfs 会直接连不上。
+	if obfs := strings.ToLower(strings.TrimSpace(qget(q, "obfs", "obfs-mode"))); obfs != "" {
+		if ver == 6 {
+			return nil, fmt.Errorf("snell v6 不支持 obfs：v6 用 PSK 派生整形，模式和服务器对不上会连不上")
+		}
+		switch obfs {
+		case "http", "tls":
+		default:
+			return nil, fmt.Errorf("snell obfs 只支持 http / tls，收到 %q", obfs)
+		}
+		n["obfs-opts"] = ProxyNode{
+			"mode": obfs,
+			"host": defaultStr(qget(q, "obfs-host", "obfshost", "host"), "bing.com"),
+		}
+	}
+
+	// UDP 从 v3 才有；v1/v2 声明了也是白搭，不如当场报错。
+	udp := ver >= 3
+	if v := qget(q, "udp"); v != "" {
+		udp = truthy(v)
+		if udp && ver <= 2 {
+			return nil, fmt.Errorf("snell v%d 不支持 UDP，请去掉 udp=1 或改用 v3 以上", ver)
+		}
+	}
+	n["udp"] = udp
+
+	// 连接复用：v2 默认就复用；v4/v6 要显式开。开了走 snell.Pool，
+	// 省掉每条 TCP 的一次完整握手，移动网络下这点 RTT 挺明显。
+	if truthy(qget(q, "reuse")) && (ver == 2 || ver == 4 || ver == 6) {
+		n["reuse"] = true
+	}
+
+	// 只有 shadow-tls / restls 这类插件才用得上，透传即可。
+	if fp := qget(q, "fingerprint", "fp", "client-fingerprint"); fp != "" {
+		n["client-fingerprint"] = fp
+	}
+	return n, nil
+}
+
 // linkKind 只按前缀判断类型，用于日志和面板展示（不解析完整节点）。
 func linkKind(link string) string {
 	l := strings.ToLower(strings.TrimSpace(link))
@@ -685,6 +808,8 @@ func linkKind(link string) string {
 		return "tuic"
 	case strings.HasPrefix(l, "anytls://"):
 		return "anytls"
+	case strings.HasPrefix(l, "snell://"):
+		return "snell"
 	case strings.HasPrefix(l, "naive"):
 		return "naive"
 	case strings.HasPrefix(l, "socks"):

@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/base64"
 	"encoding/json"
+	"strings"
 	"testing"
 )
 
@@ -192,5 +193,91 @@ func TestParseBadURI(t *testing.T) {
 		if _, err := ParseProxyURI(u); err == nil {
 			t.Errorf("%q 应该解析失败", u)
 		}
+	}
+}
+
+func TestParseSnell(t *testing.T) {
+	// v6：PSK 12–255 字节，UDP 从 v3 起才有，这里应该默认开。
+	n := mustParse(t, "snell://psk-1234567890@sn.example.com:8443?version=6")
+	if n.Kind() != "snell" {
+		t.Fatalf("类型不对: %v", n)
+	}
+	if n["server"] != "sn.example.com" || n["port"] != 8443 || n["psk"] != "psk-1234567890" {
+		t.Fatalf("地址或凭据不对: %v", n)
+	}
+	if n["version"] != 6 || n["udp"] != true {
+		t.Fatalf("版本或 udp 不对: %v", n)
+	}
+	if _, has := n["mode"]; has {
+		t.Error("没写 mode 就不该出现，交给 mihomo 用 default")
+	}
+
+	// mode 只 v6 认，取值必须和服务端一致。
+	m := mustParse(t, "snell://psk-1234567890@h:443?version=6&mode=unshaped&reuse=1")
+	if m["mode"] != "unshaped" || m["reuse"] != true {
+		t.Fatalf("v6 的 mode / reuse 不对: %v", m)
+	}
+
+	// v4 + obfs 是老组合，字段要落到 mihomo 的 obfs-opts。
+	o := mustParse(t, "snell://psk-1234567890@h:443?version=4&obfs=http&obfs-host=cdn.example.com")
+	opts, ok := o["obfs-opts"].(ProxyNode)
+	if !ok || opts["mode"] != "http" || opts["host"] != "cdn.example.com" {
+		t.Fatalf("obfs-opts 不对: %v", o)
+	}
+	if o["udp"] != true {
+		t.Error("v4 应支持 UDP")
+	}
+
+	// 不写 version 按 4 走（机场主流）；v5 服务端兼容 v4 客户端，归一成 4。
+	if d := mustParse(t, "snell://psk-1234567890@h"); d["version"] != 4 || d["port"] != 443 {
+		t.Fatalf("默认值不对: %v", d)
+	}
+	if v5 := mustParse(t, "snell://psk-1234567890@h:443?version=5"); v5["version"] != 4 {
+		t.Fatalf("v5 应归一成 v4: %v", v5)
+	}
+
+	// psk 也可以只放 query。
+	if qq := mustParse(t, "snell://h:443?psk=psk-1234567890&version=4"); qq["psk"] != "psk-1234567890" {
+		t.Fatalf("query 里的 psk 没取到: %v", qq)
+	}
+
+	// percent 编码的 psk 要解回原文，否则握手用的密钥是错的。
+	if e := mustParse(t, "snell://a%40b%2Fc%3Dd12345@h:443?version=4"); e["psk"] != "a@b/c=d12345" {
+		t.Fatalf("psk 未解码: %v", e)
+	}
+
+	// v1 没有 UDP，声明了也得拒。
+	if _, err := ParseProxyURI("snell://psk-1234567890@h:443?version=1&udp=1"); err == nil {
+		t.Error("v1 + udp 应该报错")
+	}
+}
+
+func TestParseSnellRejects(t *testing.T) {
+	cases := []struct{ uri, want string }{
+		{"snell://@h:443", "缺少 PSK"},
+		{"snell://h:443", "缺少 PSK"},
+		{"snell://psk-1234567890@h:443?version=7", "不支持"},
+		{"snell://short@h:443?version=6", "12–255"},
+		{"snell://psk-1234567890@h:443?version=6&obfs=http", "不支持 obfs"},
+		{"snell://psk-1234567890@h:443?version=6&mode=fast", "mode 只能"},
+	}
+	for _, c := range cases {
+		_, err := ParseProxyURI(c.uri)
+		if err == nil {
+			t.Errorf("%q 应该解析失败", c.uri)
+			continue
+		}
+		if !strings.Contains(err.Error(), c.want) {
+			t.Errorf("%q 的错误信息应含 %q，实际 %q", c.uri, c.want, err.Error())
+		}
+	}
+}
+
+func TestSnellIsProxyLink(t *testing.T) {
+	if linkKind("snell://psk@h:443") != "snell" {
+		t.Errorf("linkKind 应识别 snell，实际 %q", linkKind("snell://psk@h:443"))
+	}
+	if !isProxyLink("snell://psk@h:443") {
+		t.Error("snell 链接应交给 mihomo")
 	}
 }

@@ -372,13 +372,26 @@ else
 fi
 [[ -n "$GATEWAY_IP" ]] || { err "需要公网 IPv4"; exit 1; }
 
-MIHOMO_VERSION="${MIHOMO_VERSION:-1.19.28}"
+# 1.19.34 起才有 snell v6（v6 是 PSK 派生的分片混淆层），旧版遇到
+# version: 6 会直接报 "snell version error"。
+MIHOMO_VERSION="${MIHOMO_VERSION:-1.19.34}"
 
-# 代理内核：出口粘 ss/vmess/vless/trojan/hysteria2 等链接时用它落地
+# 代理内核：出口粘 ss/vmess/vless/trojan/hysteria2/snell 等链接时用它落地
 install_mihomo() {
     if command -v mihomo >/dev/null 2>&1; then
-        ok "mihomo 已存在：$(command -v mihomo)"
-        return 0
+        # 不能因为「文件存在」就跳过：老版本没有 snell v6，升级完 dotmux
+        # 出口照样连不上，而错误只落在 mihomo.log 里，很难联想到内核版本。
+        local cur=""
+        cur="$(mihomo -v 2>/dev/null | sed -n 's/.*[[:space:]]v\([0-9][0-9.]*\).*/\1/p' | head -1)"
+        if [[ -z "$cur" ]]; then
+            ok "mihomo 已存在（版本未知，跳过）：$(command -v mihomo)"
+            return 0
+        fi
+        if ! ver_gt "$MIHOMO_VERSION" "$cur"; then
+            ok "mihomo v${cur} 已存在，无需升级"
+            return 0
+        fi
+        info "mihomo v${cur} 低于 v${MIHOMO_VERSION}，升级（snell v6 需要新版）"
     fi
     local arch
     case "$(uname -m)" in

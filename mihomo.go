@@ -2,7 +2,7 @@ package main
 
 // mihomo 子进程管理：一个出口一个实例，各自监听 127.0.0.1 上的独立 socks 端口。
 // dotmux 只把这端口当普通 socks5 出口用，协议细节全交给内核，
-// 这样 ss / vmess / vless / trojan / hysteria2 / tuic / anytls / naive 都不用自己实现。
+// 这样 ss / vmess / vless / trojan / hysteria2 / tuic / anytls / snell / naive 都不用自己实现。
 
 import (
 	"crypto/sha1"
