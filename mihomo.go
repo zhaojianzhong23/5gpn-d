@@ -32,7 +32,23 @@ type mihomoProc struct {
 	link    string
 	cmd     *exec.Cmd
 	logPath string
+
+	// done 在 cmd.Wait 返回后关闭。Stop 靠它等进程真的退出，
+	// 同时保证一个 exec.Cmd 只被 Wait 一次（重复 Wait 会报错，
+	// 而且旧实现里 Process.Wait 和 cmd.Wait 混着用，僵尸进程就是这么攒出来的）。
+	done chan struct{}
+	// dead 由 wait goroutine 置位。Addr 必须看它：只看 port 的话，
+	// 内核进程崩了之后这里还在往死端口上发连接，整条出口的域名全部超时，
+	// 表现是「突然所有网页都打不开、只有直连的还能用」。
+	dead     bool
+	stopping bool
+	restarts int
+	started  time.Time
 }
+
+// 自动重启的退避间隔：首次 1 秒，之后翻倍，最多 30 秒。
+// 连崩超过 maxRestart 次就停手，把日志留给用户看——无限重启只会把 journal 刷爆。
+const maxRestart = 6
 
 func newMihomoMgr(bin, dir string) *mihomoMgr {
 	if dir == "" {
@@ -50,17 +66,25 @@ func (m *mihomoMgr) Available() bool {
 	return err == nil && !st.IsDir()
 }
 
-// Addr 返回出口对应的本地 socks5 地址，未运行则返回空。
+// Addr 返回出口对应的本地 socks5 地址，未运行（或内核已崩）则返回空。
 func (m *mihomoMgr) Addr(name string) string {
 	if m == nil {
 		return ""
 	}
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	if p, ok := m.procs[name]; ok && p.port > 0 {
-		return "127.0.0.1:" + strconv.Itoa(p.port)
+	p, ok := m.procs[name]
+	if !ok || p.port <= 0 {
+		m.mu.Unlock()
+		return ""
 	}
-	return ""
+	dead, port := p.dead, p.port
+	m.mu.Unlock()
+	if dead {
+		// 别把死端口发出去：调用方拿到它只会干等 connect 超时。
+		// 重启由 wait goroutine 负责，这里不抢。
+		return ""
+	}
+	return "127.0.0.1:" + strconv.Itoa(port)
 }
 
 // Running 返回各出口的运行状态。
@@ -72,7 +96,7 @@ func (m *mihomoMgr) Running() map[string]bool {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for k, p := range m.procs {
-		out[k] = p.cmd != nil && p.cmd.Process != nil
+		out[k] = !p.dead && p.cmd != nil && p.cmd.Process != nil
 	}
 	return out
 }
@@ -91,43 +115,52 @@ func (m *mihomoMgr) Start(name, link string) error {
 	}
 
 	m.mu.Lock()
-	defer m.mu.Unlock()
 
 	if p, ok := m.procs[name]; ok {
-		if p.link == link {
+		if p.link == link && !p.dead && p.cmd != nil {
 			// 已在跑且链接没变，直接复用
-			if p.cmd != nil && p.cmd.Process != nil {
-				return nil
-			}
+			m.mu.Unlock()
+			return nil
 		}
 		m.stopLocked(name)
 	}
 
 	node, err := ParseProxyURI(link)
 	if err != nil {
+		m.mu.Unlock()
 		return err
 	}
 	port, err := m.allocPortLocked()
 	if err != nil {
+		m.mu.Unlock()
 		return err
 	}
 
 	dir := filepath.Join(m.dir, safeFileName(name))
 	if err := os.MkdirAll(dir, 0o700); err != nil {
+		m.mu.Unlock()
 		return fmt.Errorf("创建目录失败: %w", err)
 	}
 	cfgPath := filepath.Join(dir, "config.json")
 	body, err := buildMihomoConfig(node, port)
 	if err != nil {
+		m.mu.Unlock()
 		return err
 	}
 	if err := os.WriteFile(cfgPath, body, 0o600); err != nil {
+		m.mu.Unlock()
 		return fmt.Errorf("写配置失败: %w", err)
 	}
 
 	logPath := filepath.Join(dir, "mihomo.log")
-	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	// 追加而不是清空：自动重启时要能看到崩溃前那几行，否则永远查不出为什么挂。
+	// 超过 1MB 就轮转一份，只留上一轮。
+	if st, serr := os.Stat(logPath); serr == nil && st.Size() > 1<<20 {
+		_ = os.Rename(logPath, logPath+".1")
+	}
+	lf, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
 	if err != nil {
+		m.mu.Unlock()
 		return fmt.Errorf("打开日志失败: %w", err)
 	}
 	cmd := exec.Command(m.bin, "-d", dir, "-f", cfgPath)
@@ -136,29 +169,99 @@ func (m *mihomoMgr) Start(name, link string) error {
 	cmd.Stderr = lf
 	if err := cmd.Start(); err != nil {
 		lf.Close()
+		m.mu.Unlock()
 		return fmt.Errorf("启动 mihomo 失败: %w", err)
 	}
-	// 父进程退出后子进程不该留下，但正常停止由 Stop 负责
-	proc := &mihomoProc{name: name, port: port, link: link, cmd: cmd, logPath: logPath}
+	proc := &mihomoProc{
+		name: name, port: port, link: link, cmd: cmd, logPath: logPath,
+		done: make(chan struct{}), started: time.Now(),
+	}
 	m.procs[name] = proc
+	m.mu.Unlock()
 
-	// 等端口起来；失败时把日志尾部带出来，否则用户只能看到“连不上”
+	// 必须有人 Wait，否则子进程退出后变成僵尸，重启几次就攒一堆。
+	// 顺带把「内核挂了」这件事变成可观测事件，并且自动拉起来。
+	go func() {
+		werr := cmd.Wait()
+		close(proc.done)
+		m.onExit(name, proc, werr)
+	}()
+
+	// 等端口就绪。这一步刻意放在锁外：以前它持着 m.mu 等最多 8 秒，
+	// 而 Dyn.Resolve 每条连接都要拿这把锁——一个出口重启，全网连接跟着卡 8 秒。
 	deadline := time.Now().Add(8 * time.Second)
 	for time.Now().Before(deadline) {
-		if c, err := net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(port), 300*time.Millisecond); err == nil {
+		if c, derr := net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(port), 300*time.Millisecond); derr == nil {
 			c.Close()
 			lf.Close()
 			logf("info", "出口 %s（%s）已就绪，本地 socks5 127.0.0.1:%d", name, node.Kind(), port)
 			return nil
 		}
-		if cmd.ProcessState != nil && cmd.ProcessState.Exited() {
-			break
+		select {
+		case <-proc.done:
+			// 进程已经退出了，不用再等满 8 秒
+			lf.Close()
+			m.Stop(name)
+			return fmt.Errorf("mihomo 启动即退出（出口 %s）: %s", name, tailFile(logPath, 3))
+		case <-time.After(120 * time.Millisecond):
 		}
-		time.Sleep(120 * time.Millisecond)
 	}
-	m.stopLocked(name)
 	lf.Close()
+	m.Stop(name)
 	return fmt.Errorf("mihomo 启动后端口未就绪（出口 %s）: %s", name, tailFile(logPath, 3))
+}
+
+// onExit 在内核进程退出后运行：标记状态、打日志、按退避自动重启。
+//
+// 没有这段的时候，mihomo 被 OOM 或自身 panic 杀掉之后没人知道，
+// procs 里那条记录还留着，Addr 继续返回死端口——所有走该出口的域名
+// 集体超时，看起来像「网络突然废了」，重启整个服务才恢复。
+func (m *mihomoMgr) onExit(name string, p *mihomoProc, err error) {
+	m.mu.Lock()
+	cur, ok := m.procs[name]
+	if !ok || cur != p {
+		m.mu.Unlock()
+		return // 已经被替换或主动停止了
+	}
+	p.dead = true
+	stopping := p.stopping
+	// 稳定跑过一分钟再崩，算新的一轮，不受之前的连续失败次数拖累
+	if time.Since(p.started) > time.Minute {
+		p.restarts = 0
+	}
+	p.restarts++
+	n := p.restarts
+	link := p.link
+	m.mu.Unlock()
+
+	if stopping {
+		return
+	}
+	if n > maxRestart {
+		logf("error", "出口 %s 连续 %d 次退出（%v），暂停自动重启：在 Bot 里手动重启，或检查节点链接", name, n, err)
+		return
+	}
+	gap := time.Second << (n - 1)
+	if gap > 30*time.Second {
+		gap = 30 * time.Second
+	}
+	logf("warn", "出口 %s 的内核进程退出（%v），%s 后第 %d 次自动重启", name, err, gap, n)
+
+	go func() {
+		time.Sleep(gap)
+		m.mu.Lock()
+		cur, ok := m.procs[name]
+		still := ok && cur == p && !p.stopping
+		m.mu.Unlock()
+		if !still {
+			return
+		}
+		if e := m.Start(name, link); e != nil {
+			logf("error", "出口 %s 自动重启失败: %v", name, e)
+		} else {
+			logf("info", "出口 %s 已自动重启", name)
+		}
+	}()
 }
 
 // Stop 停止一个出口。
@@ -176,18 +279,20 @@ func (m *mihomoMgr) stopLocked(name string) {
 	if !ok {
 		return
 	}
-	if p.cmd != nil && p.cmd.Process != nil {
+	p.stopping = true
+	if !p.dead && p.cmd != nil && p.cmd.Process != nil {
 		_ = p.cmd.Process.Signal(os.Interrupt)
-		done := make(chan struct{})
-		go func() {
-			_, _ = p.cmd.Process.Wait()
-			close(done)
-		}()
+		// 等 wait goroutine 关掉 done，而不是自己再 Wait 一次：
+		// 对同一个 exec.Cmd 重复 Wait 会报 "Wait was already called"，
+		// 旧实现就是这么漏掉僵尸回收的。
 		select {
-		case <-done:
+		case <-p.done:
 		case <-time.After(2 * time.Second):
 			_ = p.cmd.Process.Kill()
-			<-done
+			select {
+			case <-p.done:
+			case <-time.After(time.Second):
+			}
 		}
 	}
 	delete(m.procs, name)

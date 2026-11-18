@@ -137,11 +137,7 @@ func (b *tgBot) renderStatus() (string, *tgKeyboard) {
 	sb.WriteString(fmt.Sprintf("%s DoT     %s\n", mark(health["dot"]), b.cfg.Listen.DoT))
 	sb.WriteString(fmt.Sprintf("%s SNI 转发 %s / %s\n", mark(health["sni"]), b.cfg.Listen.TLS, b.cfg.Listen.HTTP))
 	if b.quicOn() {
-		via := "随分流走代理"
-		if b.cfg.QUIC.UDPDirect {
-			via = "本机直连"
-		}
-		sb.WriteString(fmt.Sprintf("%s QUIC    %s/udp（%s）\n", mark(health["quic"]), b.cfg.QUIC.Listen, via))
+		sb.WriteString(fmt.Sprintf("%s QUIC    %s/udp（%s）\n", mark(health["quic"]), b.cfg.QUIC.Listen, quicVia(b.cfg)))
 	} else {
 		sb.WriteString("➖ QUIC    未启用\n")
 	}
@@ -464,7 +460,9 @@ func (b *tgBot) renderManage() (string, *tgKeyboard) {
 		"🔐 证书：%s\n"+
 		"⚡ QUIC 中继：%s\n"+
 		"   单入口下多标签并发 H3 会串流，表现是「第一次能开、刷新白屏」；\n"+
-		"   碰到就关掉，浏览器立刻回落 TCP，分流不受影响。开关热生效，无需重启。\n",
+		"   碰到就关掉，浏览器立刻回落 TCP，分流不受影响。开关热生效，无需重启。\n"+
+		"   短视频类（TikTok / Reels）如果「看几个就卡住」，也先关它试一轮：\n"+
+		"   H3 走 UDP，中继看不见加密帧，多连接并发时比 TCP 那条路脆。\n",
 		dom, strings.Join(stripPort(remote), "  "), strings.Join(stripPort(local), "  "), certLine, quicLine)
 
 	quicBtn := "⚡ QUIC：关 → 开"
@@ -482,11 +480,15 @@ func (b *tgBot) renderManage() (string, *tgKeyboard) {
 }
 
 // quicVia 说明 QUIC 包走哪条路出去，和状态页保持同一套说法。
+//
+// 默认行为是「和 TCP 走同一条出口」：同一个会话的上下行从同一处出去，
+// 对端做 IP 一致性校验时不会前后矛盾。udp_direct 只是出口不吃 UDP 时的
+// 逃生阀，代价是对端会看到网关自己的 IP。
 func quicVia(cfg *Config) string {
 	if cfg.QUIC.UDPDirect {
-		return "本机直连"
+		return "随出口，不支持时回退本机"
 	}
-	return "随分流走代理"
+	return "随出口（与 TCP 一致）"
 }
 
 func helpText() string {

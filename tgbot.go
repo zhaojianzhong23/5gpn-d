@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // tgDeps 是 Bot 需要回调用到的运行时能力。
@@ -50,6 +51,9 @@ type tgBot struct {
 	off   int64
 	state string
 	sess  map[int64]*tgsess
+	// chatMu 给每个聊天一把串行锁：同一个人连点几个按钮要按顺序生效，
+	// 但不同聊天之间不能互相挡——探测出口、拉远端规则这类操作动辄十几秒。
+	chatMu map[int64]*sync.Mutex
 }
 
 type tgAPIResp struct {
@@ -93,12 +97,27 @@ func startTelegram(cfg *Config, deps tgDeps) *tgBot {
 		logf("warn", "telegram.token 已配置但 admin_ids 为空，Bot 将拒绝所有操作")
 	}
 	b := &tgBot{
-		cfg:   cfg,
-		deps:  deps,
-		api:   "https://api.telegram.org/bot" + cfg.Telegram.Token,
-		http:  &http.Client{Timeout: 45 * time.Second},
-		state: cfg.Telegram.StateFile,
-		sess:  map[int64]*tgsess{},
+		cfg:    cfg,
+		deps:   deps,
+		api:    "https://api.telegram.org/bot" + cfg.Telegram.Token,
+		state:  cfg.Telegram.StateFile,
+		sess:   map[int64]*tgsess{},
+		chatMu: map[int64]*sync.Mutex{},
+		http: &http.Client{
+			// 这个值要盖得住 getUpdates 的长轮询（25 秒）再加一次跨境往返。
+			// 以前是 45 秒配 30 秒轮询，链路一抖就整条请求超时，offset 没推进，
+			// 同一批 update 下一轮还会再来一遍。
+			Timeout: 70 * time.Second,
+			Transport: &http.Transport{
+				Proxy: http.ProxyFromEnvironment,
+				// 默认每主机只留 2 条空闲连接，而 Bot 每次点击至少要发一条
+				// editMessage / answerCallbackQuery。跨境重新做一次 TLS 握手
+				// 就是 1~2 秒的等待——用户体感正是「点了没反应」。
+				MaxIdleConns:        32,
+				MaxIdleConnsPerHost: 8,
+				IdleConnTimeout:     90 * time.Second,
+			},
+		},
 	}
 	b.loadOffset()
 	go b.loop()
@@ -151,7 +170,7 @@ func (b *tgBot) loop() {
 		}
 		backoff = time.Second
 		for _, u := range ups {
-			b.handle(u)
+			b.dispatch(u)
 			if u.UpdateID >= b.off {
 				b.off = u.UpdateID + 1
 				b.saveOffset()
@@ -160,13 +179,58 @@ func (b *tgBot) loop() {
 	}
 }
 
+// dispatch 把一条更新交给后台处理，轮询本身不再被它拖住。
+//
+// 以前是 for 循环里直接 handle(u)：一次「探测出口」或「刷新远端规则」
+// 就能把循环按住十几秒，期间所有点击都排在它后面，用户看到的就是
+// 「按钮点了没反应」，而且越急越点、越点越堆。
+func (b *tgBot) dispatch(u tgUpdate) {
+	chatID := int64(0)
+	if u.CallbackQuery != nil {
+		if u.CallbackQuery.Message != nil {
+			chatID = u.CallbackQuery.Message.Chat.ID
+		}
+		// callback 的应答必须马上发：Telegram 客户端会一直转圈等它，
+		// 超过十几秒用户就以为按钮坏了。放到后台会排在慢操作后面；
+		// 但也不能同步阻塞轮询——跨境链路抖一下就是几十秒。
+		if b.allowed(chatID) {
+			go b.answerCallback(u.CallbackQuery.ID, "")
+		}
+	} else if u.Message != nil {
+		chatID = u.Message.Chat.ID
+	}
+
+	mu := b.chatLock(chatID)
+	go func() {
+		mu.Lock()
+		defer mu.Unlock()
+		b.handle(u)
+	}()
+}
+
+// chatLock 取某个聊天的串行锁。
+func (b *tgBot) chatLock(chatID int64) *sync.Mutex {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.chatMu == nil {
+		b.chatMu = map[int64]*sync.Mutex{}
+	}
+	mu, ok := b.chatMu[chatID]
+	if !ok {
+		mu = &sync.Mutex{}
+		b.chatMu[chatID] = mu
+	}
+	return mu
+}
+
 func (b *tgBot) getUpdates() ([]tgUpdate, error) {
 	b.mu.Lock()
 	off := b.off
 	b.mu.Unlock()
 	payload := map[string]any{
-		"offset":          off,
-		"timeout":         30,
+		"offset":  off,
+		"timeout": 25,
+		// 只推这两种更新：不要在 Bot 里处理别人转发的图片/贴纸，白白占带宽。
 		"allowed_updates": []string{"message", "callback_query"},
 	}
 	var ups []tgUpdate
@@ -246,7 +310,7 @@ func (b *tgBot) handle(u tgUpdate) {
 			b.answerCallback(cq.ID, "无权限")
 			return
 		}
-		b.answerCallback(cq.ID, "")
+		// 应答已经在 dispatch 里发过了，这里只做实际操作。
 		b.onCallback(chatID, msgID, cq.Data)
 		return
 	}
@@ -352,12 +416,20 @@ func (b *tgBot) answerCallback(id, text string) {
 }
 
 // clip 防止超过 Telegram 4096 字符上限。
+//
+// 必须按 rune 边界切：s[:3900] 会把中文或 emoji 从中间劈开，产出一段非法
+// UTF-8，Telegram 直接 400 拒收整条消息——表现就是「点了按钮什么反应都没有」。
+// 页面里恰好全是中文和 emoji，规则一多就会撞到这条线。
 func clip(s string) string {
 	const max = 3900
 	if len(s) <= max {
 		return s
 	}
-	return s[:max] + "\n…（已截断）"
+	cut := max
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "\n…（已截断）"
 }
 
 func (b *tgBot) loadOffset() {
