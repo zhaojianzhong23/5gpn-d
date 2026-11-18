@@ -57,14 +57,26 @@ func TestSuperviseRebindsAfterClose(t *testing.T) {
 	waitAlive(t, s, true)
 
 	// 模拟 listener 被意外回收，supervise 应当立刻重建。
-	// 重建足够快，中间不检查 false，只看最终是否恢复可用。
+	//
+	// 这里不能等 alive 标志：它在新 listener 建好之前仍是 true，立刻 dial 会
+	// 撞上「旧 listener 已关、新的还没 bind」的窗口，CI 上偶发 connection
+	// refused。重建是异步的，直接轮询端口直到真能连上，测的也才是真正
+	// 关心的东西——443 最终会自己回来。
 	_ = ln.Close()
-	waitAlive(t, s, true)
-	c, err := net.DialTimeout("tcp", addr, time.Second)
-	if err != nil {
-		t.Fatalf("重建后仍连不上 %s: %v", addr, err)
+	deadline := time.Now().Add(3 * time.Second)
+	var lastErr error
+	for {
+		c, err := net.DialTimeout("tcp", addr, 200*time.Millisecond)
+		if err == nil {
+			_ = c.Close()
+			break
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			t.Fatalf("重建后仍连不上 %s: %v", addr, lastErr)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	_ = c.Close()
 }
 
 func waitAlive(t *testing.T, s *snipSvc, want bool) {
