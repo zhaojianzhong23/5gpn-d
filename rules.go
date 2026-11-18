@@ -79,6 +79,84 @@ type RuleSet struct {
 	suff  map[string]idxRule
 	kws   []kwRule
 	built bool
+
+	// fallbackDone 保证内置兜底只追加一次（Build 会被反复调用）。
+	fallbackDone bool
+}
+
+// builtinProxySuffix 是内置的「必须走代理」兜底域名。
+//
+// TikTok 的流量分散在十几个域名家族上：API 在 tiktokv.com，视频分片在
+// tiktokcdn / tiktokcdn-us / ttlivecdn，后端在 byteoversea / ibytedtos，
+// 封面图在 ibyteimg / muscdn。远端规则只要漏掉其中一两个，症状就是
+// 「封面能加载、视频一直转圈」——API 那条走了代理，分片 CDN 却直连出去被 RST，
+// 客户端反复重试。这份表只补规则里没覆盖的，不覆盖用户显式配置。
+//
+// 刻意不收 bytedance.com / pstatp.com / snssdk.com：它们同时服务国内抖音和今日头条，
+// 一刀切走代理会把国内业务的流量也绕一圈。
+var builtinProxySuffix = []string{
+	"tiktok.com",
+	"tiktokv.com",
+	"tiktokv.us",
+	"tiktokv.eu",
+	"tiktokcdn.com",
+	"tiktokcdn-us.com",
+	"tiktokcdn-eu.com",
+	"tiktokcdn-in.com",
+	"tiktokd.org",
+	"tiktokd.net",
+	"tiktokstaticb.com",
+	"tiktokrow-cdn.com",
+	"tiktokglobalshop.com",
+	"ttlivecdn.com",
+	"ttlivecdn.net",
+	"ttwstatic.com",
+	"muscdn.com",
+	"musical.ly",
+	"byteoversea.com",
+	"ibytedtos.com",
+	"ibyteimg.com",
+	"byteicdn.com",
+}
+
+// addBuiltinProxyFallback 补上内置兜底规则，只处理规则集里没人管的家族。
+//
+// 兜底只写进后缀索引，不追加到 rs.Rules：它是「规则没覆盖时才生效的默认值」，
+// 不该出现在规则条数、Bot 列表里，也不该被当成一条用户规则参与优先级计算。
+// order 取一个远大于真实规则数的值，保证优先级低于所有显式配置。
+func (rs *RuleSet) addBuiltinProxyFallback() {
+	if rs.fallbackDone {
+		return
+	}
+	rs.fallbackDone = true
+	if rs.suff == nil {
+		return
+	}
+	const fallbackOrder = 1 << 29
+	added := 0
+	for _, v := range builtinProxySuffix {
+		covered := false
+		// 逐级截断看有没有现成的后缀规则能覆盖它（tiktok.com 能覆盖 cdn.tiktok.com）
+		for d := v; ; {
+			if _, ok := rs.suff[d]; ok {
+				covered = true
+				break
+			}
+			i := strings.IndexByte(d, '.')
+			if i < 0 {
+				break
+			}
+			d = d[i+1:]
+		}
+		if covered {
+			continue
+		}
+		rs.suff[v] = idxRule{order: fallbackOrder, action: ActionProxy}
+		added++
+	}
+	if added > 0 {
+		logf("info", "内置兜底：%d 个 TikTok 域名家族按 proxy 处理（现有规则未覆盖）", added)
+	}
 }
 
 type idxRule struct {
@@ -97,6 +175,9 @@ type kwRule struct {
 // Build 建立匹配索引。同名条目只保留顺序最靠前的一条，因为 first-match 之后
 // 的同名规则永远不会生效。
 func (rs *RuleSet) Build() {
+	// 索引是整张重建的，兜底也要跟着重建一次：这里不清标记，
+	// 同一个 RuleSet 二次 Build 之后兜底就悄悄没了。
+	rs.fallbackDone = false
 	rs.exact = make(map[string]idxRule, len(rs.Rules))
 	rs.suff = make(map[string]idxRule, len(rs.Rules))
 	rs.kws = make([]kwRule, 0, 16)
@@ -118,6 +199,7 @@ func (rs *RuleSet) Build() {
 		}
 	}
 	rs.built = true
+	rs.addBuiltinProxyFallback()
 }
 
 func newRuleSet(rules []Rule, final Action) *RuleSet {

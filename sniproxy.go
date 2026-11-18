@@ -15,8 +15,6 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
-
-	"github.com/miekg/dns"
 )
 
 type snipSvc struct {
@@ -288,7 +286,11 @@ func (s *snipSvc) handle(c net.Conn, isTLS bool) {
 	// kfc.example.com 的 A 记录指向本机），直接丢弃。否则会形成
 	// 本机:随机端口 → 本机:80/443 → 再解析 → 再连自己 的死循环，
 	// 几次就把 fd 冲到 65535，表现为「443 凭空消失 + DNS 全部 too many open files」。
-	if s.isSelfTarget(host, s.dyn.RemoteDNS()) {
+	//
+	// 只对直连出口做：走 socks5/mihomo 时域名原样交给出口端解析，本机不会
+	// 去连 gateway_ip，构不成自环。这一步每次都要查一次 DNS，TikTok 开一屏
+	// 几十条连接时是实打实的延迟，能省就省。
+	if exit.Type == "direct" && s.isSelfTarget(host, s.dyn.RemoteDNS()) {
 		logf("debug", "忽略指向本机的转发目标 %s（防止自连接死循环）", host)
 		return
 	}
@@ -387,32 +389,6 @@ func classify(isTLS bool) string {
 		return "https"
 	}
 	return "http"
-}
-
-func resolveA(upstreams []string, host string) (net.IP, error) {
-	m := new(dns.Msg)
-	m.SetQuestion(dns.Fqdn(host), dns.TypeA)
-	m.RecursionDesired = true
-	var lastErr error
-	for _, up := range upstreams {
-		up = dnsAddr(up)
-		c := &dns.Client{Timeout: 3 * time.Second}
-		resp, _, err := c.Exchange(m, up)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		for _, a := range resp.Answer {
-			if rec, ok := a.(*dns.A); ok {
-				return rec.A, nil
-			}
-		}
-		lastErr = fmt.Errorf("无 A 记录")
-	}
-	if lastErr == nil {
-		lastErr = errors.New("解析失败")
-	}
-	return nil, lastErr
 }
 
 // peekHost 读取但不消费分流所需的头部字节。
@@ -569,6 +545,12 @@ func pump(br *bufio.Reader, upstream net.Conn, client net.Conn) {
 // idleTimeout 是单向流量的空闲上限：这么久一个字节都没有才认为连接已死。
 const idleTimeout = 3 * time.Minute
 
+// writeTimeout 是单次写操作的上限。只设读超时是不够的：对端不收包时 Write
+// 会一直堵在发送窗口上，两个方向都不再读，这条连接既不会超时也不会被回收，
+// 就那么占着 fd——手机从 Wi-Fi 切到 5G 留下的半死长连接全是这个形态，
+// 攒上几百条就开始出现「新连接连不上、旧连接不响应」。
+const writeTimeout = 45 * time.Second
+
 // copyBufPool 复用中转缓冲，避免每条连接各分配一次。
 var copyBufPool = sync.Pool{
 	New: func() any {
@@ -594,6 +576,7 @@ func copyFlow(dst net.Conn, src io.Reader, srcConn net.Conn) {
 		}
 		n, err := src.Read(b)
 		if n > 0 {
+			_ = dst.SetWriteDeadline(time.Now().Add(writeTimeout))
 			if _, werr := dst.Write(b[:n]); werr != nil {
 				return
 			}

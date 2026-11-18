@@ -45,6 +45,14 @@ type quicRelay struct {
 	// 连 TCP 转发和 DoT 都分不到 socket。上限和 TCP 那道闸门是一个道理。
 	live atomic.Int64
 
+	// perClient 是「客户端地址 → 它在册的会话」。lookup 的兜底分支要判断某个
+	// 客户端是不是只有一条会话，以前靠全表 Range；TikTok 会同时开好几条 h3
+	// 连接（视频流、图片、API 各一条），连接 ID 轮换之后短头包频繁落到兜底分支，
+	// 在收包主循环里扫几千条映射，直接表现为丢包和卡顿。这里维护一份精确索引，
+	// 查一次哈希就够。
+	cmu       sync.Mutex
+	perClient map[string]map[*quicSession]struct{}
+
 	// addrMu 保护域名解析结果缓存。QUIC 会话是短命的，每次新建都要解析一次
 	// 域名，全部回源到境外 DNS 既慢又浪费——同一个站点几秒钟内可能建十几条。
 	addrMu sync.Mutex
@@ -147,7 +155,40 @@ func (s *quicSession) close() {
 		}
 		s.keys = nil
 		s.mu.Unlock()
+		s.r.detach(s)
 	})
+}
+
+// attach 把会话登记到「客户端 → 会话」索引里；同一会话只登记一次。
+func (r *quicRelay) attach(s *quicSession) {
+	key := s.client.String()
+	r.cmu.Lock()
+	if r.perClient == nil {
+		r.perClient = make(map[string]map[*quicSession]struct{})
+	}
+	set := r.perClient[key]
+	if set == nil {
+		set = make(map[*quicSession]struct{}, 2)
+		r.perClient[key] = set
+	}
+	set[s] = struct{}{}
+	r.cmu.Unlock()
+}
+
+// detach 在会话关闭时清掉索引项，避免 map 里留下已死的指针。
+func (r *quicRelay) detach(s *quicSession) {
+	if s.client == nil {
+		return
+	}
+	key := s.client.String()
+	r.cmu.Lock()
+	if set := r.perClient[key]; set != nil {
+		delete(set, s)
+		if len(set) == 0 {
+			delete(r.perClient, key)
+		}
+	}
+	r.cmu.Unlock()
 }
 
 // cidKey 拼接会话键。带客户端地址前缀，避免不同客户端的连接 ID 撞在一起。
@@ -164,6 +205,13 @@ func startQUIC(cfg *Config, rules func() *RuleSet, dyn *Dyn) (*quicRelay, error)
 	if err != nil {
 		return nil, err
 	}
+	// 这一个 socket 收所有客户端的 H3 流量。系统默认接收缓冲只有 200KB 上下，
+	// 视频码率冲到几 Mbps 时一个突发就溢出，内核直接把包丢了——上层只能看到
+	// 客户端重传，表现就是画面卡一下再继续。放大到 4MB，配合安装脚本里的
+	// net.core.rmem_max 才真正生效（超过 rmem_max 的值会被内核截断）。
+	const udpBuf = 4 << 20
+	_ = conn.SetReadBuffer(udpBuf)
+	_ = conn.SetWriteBuffer(udpBuf)
 	r := &quicRelay{
 		conn:  conn,
 		cfg:   cfg,
@@ -284,23 +332,17 @@ func isInitialPkt(pkt []byte) bool {
 }
 
 // sole 返回该客户端唯一的一条会话；有多条时不猜，返回 nil。
+// 走 perClient 索引，O(1)——这个函数在收包主循环的热路径上。
 func (r *quicRelay) sole(addr *net.UDPAddr) *quicSession {
 	key := addr.String()
-	var got *quicSession
-	n := 0
-	r.sess.Range(func(_, v any) bool {
-		s := v.(*quicSession)
-		if s.client.String() != key {
-			return true
-		}
-		if got != s {
-			got = s
-			n++
-		}
-		return n < 2
-	})
-	if n == 1 {
-		return got
+	r.cmu.Lock()
+	defer r.cmu.Unlock()
+	set := r.perClient[key]
+	if len(set) != 1 {
+		return nil
+	}
+	for s := range set {
+		return s
 	}
 	return nil
 }
@@ -378,6 +420,8 @@ func (r *quicRelay) handleNew(addr *net.UDPAddr, pkt []byte) {
 
 	s := &quicSession{r: r, client: addr, up: up, target: host, keys: map[string]struct{}{}}
 	r.live.Add(1)
+	// 先登记再起泵：之后任何路径上的 close 都能保证 detach 一定找得到索引项。
+	r.attach(s)
 	s.touch()
 	s.addKey(ini.dcid)
 	go r.pumpBack(s)

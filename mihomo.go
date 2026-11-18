@@ -238,17 +238,47 @@ func buildMihomoConfig(node ProxyNode, socksPort int) ([]byte, error) {
 		"find-process-mode": "off",
 		"geo-auto-update":   false,
 		"proxies":           []any{node},
+		// 出口端自己也要解析域名：socks 入站收到的是域名（避免本地污染），
+		// 真正去连的时候由内核解析。不显式指定的话它用系统 DNS，而机房的
+		// /etc/resolv.conf 未必可信——解析被污染就会连到错的 IP，
+		// 表现是「能连上但内容一直加载不出来」。
+		"dns": map[string]any{
+			"enable":             true,
+			"ipv6":               false,
+			"enhanced-mode":      "normal",
+			"default-nameserver": []any{"1.1.1.1", "8.8.8.8"},
+			"nameserver":         []any{"1.1.1.1", "8.8.8.8", "9.9.9.9"},
+		},
 		"listeners": []any{map[string]any{
 			"name":   "socks-in",
 			"type":   "socks",
 			"listen": "127.0.0.1",
 			"port":   socksPort,
-			"udp":    true,
-			"proxy":  "out",
+			// 出口自己不支持 UDP（naive 的 HTTP CONNECT、snell v1/v2）时，
+			// 这里必须一起关掉。否则 socks5 的 UDP ASSOCIATE 会照常成功，
+			// 随后每个数据包都被内核静默丢掉——客户端以为 QUIC 可用，
+			// 卡在 h3 上不回落 TCP，表现就是「视频一直转圈」。
+			// 关掉之后关联请求直接被拒，上游一秒内失败，客户端立刻改走 TCP。
+			"udp":   nodeUDP(node),
+			"proxy": "out",
 		}},
 		"rules": []any{"MATCH,out"},
 	}
 	return json.MarshalIndent(cfg, "", "  ")
+}
+
+// nodeUDP 报告节点是否支持 UDP 转发。解析链接时一般会显式写上 udp 字段，
+// 没写的按支持处理（ss / vmess / vless / trojan / hysteria2 / tuic 都支持）。
+func nodeUDP(node ProxyNode) bool {
+	if v, ok := node["udp"].(bool); ok {
+		return v
+	}
+	switch node.Kind() {
+	case "http", "snell":
+		// http 就是 naive 的落地方案，只有 TCP；snell 老版本协议没有 UDP
+		return false
+	}
+	return true
 }
 
 // safeFileName 把出口名变成安全目录名，中文名用哈希避免各种编码问题。
