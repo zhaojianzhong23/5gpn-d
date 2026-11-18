@@ -12,8 +12,10 @@ import (
 )
 
 // TestEDNSClientSubnet 锁住两件事：
-//  1. 托管来源查国内域名时带上 ECS，否则境外 VPS 查国内 DNS 会拿到海外 CDN 节点；
-//  2. 非托管来源不带 ECS，不替公网查询伪造位置。
+//  1. 托管来源查国内域名时带上配置的 ECS，否则境外 VPS 查国内 DNS 会拿到海外 CDN 节点；
+//  2. 非托管来源带它自己来源网段的 /24——手机回家连 Wi-Fi 就是这条路，不带的话
+//     淘宝会被解析到 155.102.x 这类海外节点，直连反而更慢；
+//  3. 私网来源不带上游，免得塞无效网段。
 func TestEDNSClientSubnet(t *testing.T) {
 	var mu sync.Mutex
 	seen := map[string]string{}
@@ -86,6 +88,7 @@ func TestEDNSClientSubnet(t *testing.T) {
 
 	ask("managed.domestic.test", "172.22.1.10")
 	ask("public.domestic.test", "8.8.8.8")
+	ask("lan.domestic.test", "192.168.1.50")
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -93,8 +96,11 @@ func TestEDNSClientSubnet(t *testing.T) {
 	if got := seen["managed.domestic.test."]; got != "139.226.48.0" {
 		t.Fatalf("托管来源的 ECS = %q，应为 139.226.48.0/24", got)
 	}
-	if got, ok := seen["public.domestic.test."]; !ok || got != "" {
-		t.Fatalf("非托管来源不应带 ECS，实际 %q", got)
+	if got, ok := seen["public.domestic.test."]; !ok || got != "8.8.8.0" {
+		t.Fatalf("非托管来源的 ECS = %q，应为它自己的 8.8.8.0/24", got)
+	}
+	if got, ok := seen["lan.domestic.test."]; !ok || got != "" {
+		t.Fatalf("私网来源不应带 ECS，实际 %q", got)
 	}
 }
 

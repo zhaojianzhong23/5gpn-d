@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -26,7 +27,21 @@ type snipSvc struct {
 
 	tlsUp  atomic.Bool
 	httpUp atomic.Bool
+
+	// inflight 是同时处理的连接总数，guest 是非托管来源占的那部分。
+	// fd 是共享资源，一旦打满连 DoT 都分不到 socket，所以必须有个总数闸门；
+	// 而扫描器能轻松打到几千并发，给它单开一份额度，别把手机那条路挤掉。
+	inflight atomic.Int64
+	guest    atomic.Int64
 }
+
+// maxInflight 是同时处理的连接总数上限。
+const maxInflight = 4096
+
+// maxInflightGuest 是非托管来源独占的额度。
+// 这里刻意不「一刀切拒绝」：自己家 Wi-Fi 经路由器代理回程、别人的设备、
+// 公网扫描器，从网关角度看都是非托管来源，拒掉会连自家那条路一起断掉。
+const maxInflightGuest = 512
 
 // sniCurrent 指向当前存活的 SNI 服务，供健康检查读取真实监听状态。
 var sniCurrent atomic.Pointer[snipSvc]
@@ -197,6 +212,33 @@ func transientAccept(err error) bool {
 func (s *snipSvc) handle(c net.Conn, isTLS bool) {
 	start := time.Now()
 	defer c.Close()
+
+	remoteIP := remoteIPOf(c)
+	managed := inNets(remoteIP, s.nets)
+
+	// 自环链的第一跳在这里断掉：正常客户端不可能从本机/回环地址连进来。
+	// 线上事故里就是这条链没说清——一条连接转发出去又打回自己，翻倍到
+	// 几百条，goroutine 编号涨到九百万，CPU 190% 空转、fd 打满。
+	if s.selfGuardOn() && isSelfishIP(remoteIP) {
+		logf("debug", "丢弃来自本机/回环的请求 %s", c.RemoteAddr())
+		return
+	}
+	// 闸门放在读请求之前：fd 用满是致命状态，先把代价最小的判断做掉。
+	if !managed && s.guest.Load() >= maxInflightGuest {
+		logf("warn", "非托管来源并发已达上限 %d，丢弃 %s", maxInflightGuest, c.RemoteAddr())
+		return
+	}
+	if s.inflight.Load() >= maxInflight {
+		logf("warn", "并发连接已达上限 %d，丢弃 %s", maxInflight, c.RemoteAddr())
+		return
+	}
+	s.inflight.Add(1)
+	defer s.inflight.Add(-1)
+	if !managed {
+		s.guest.Add(1)
+		defer s.guest.Add(-1)
+	}
+
 	_ = c.SetReadDeadline(time.Now().Add(15 * time.Second))
 
 	br := bufio.NewReaderSize(c, 32*1024)
@@ -211,9 +253,6 @@ func (s *snipSvc) handle(c net.Conn, isTLS bool) {
 	if !isTLS && s.acmeChallenge(c, br) {
 		return
 	}
-
-	remoteIP := remoteIPOf(c)
-	managed := inNets(remoteIP, s.nets)
 
 	port := 443
 	if !isTLS {
@@ -254,8 +293,11 @@ func (s *snipSvc) handle(c net.Conn, isTLS bool) {
 	}
 	defer upstream.Close()
 
-	_ = upstream.SetDeadline(time.Now().Add(2 * time.Minute))
-	pump(br, upstream, c, 30*time.Second)
+	// 以前这里是「建连后 2 分钟」的绝对截止 + pump 里 30 秒的硬超时，两样
+	// 都会把长连接掐死：大文件下到一半失败、视频播几十秒就断。改成空闲超时，
+	// 只要还在搬字节就一直续期，真僵死的由 copyFlow 回收。
+	_ = upstream.SetDeadline(time.Time{})
+	pump(br, upstream, c)
 	logf("debug", "%s %s:%d via %s %dms", classify(isTLS), host, port, exit.Name, time.Since(start).Milliseconds())
 }
 
@@ -497,42 +539,93 @@ func parseHostHeader(b []byte) (string, error) {
 //
 // timeout 是整机兜底：极端情况下两路都不结束（如对端半开不读不写），到点
 // 强制关闭。正常连接靠"任一路结束即关闭"早已回收，不会等到超时。
-func pump(br *bufio.Reader, upstream net.Conn, client net.Conn, timeout time.Duration) {
+func pump(br *bufio.Reader, upstream net.Conn, client net.Conn) {
 	done := make(chan struct{}, 2)
 	go func() {
-		_, _ = io.Copy(upstream, br)
+		copyFlow(upstream, br, client)
 		done <- struct{}{}
 	}()
 	go func() {
-		_, _ = io.Copy(client, upstream)
+		copyFlow(client, upstream, upstream)
 		done <- struct{}{}
 	}()
 
-	// 关一次就够：net.Conn.Close 幂等，多处调用安全。
-	closeBoth := func() {
-		_ = upstream.Close()
-		_ = client.Close()
-	}
+	// 任一路结束就关掉两端：上游已经 FIN 的那半条如果留着，会一直挂在
+	// CLOSE-WAIT 里等客户端自己超时，几百条一叠就是 accept: too many
+	// open files。关闭之后另一路会立刻返回，不用担心泄漏。
+	<-done
+	_ = client.Close()
+	_ = upstream.Close()
+	<-done
+}
 
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case <-done:
-		// 任一路结束：立刻完全关闭两端，打断另一路。
-		closeBoth()
-		<-done // 等另一路退出（关闭后它会立即返回）
-	case <-timer.C:
-		// 兜底：两路都没结束，强制关闭并等它们退出。
-		closeBoth()
-		select {
-		case <-done:
-		case <-time.After(3 * time.Second):
+// idleTimeout 是单向流量的空闲上限：这么久一个字节都没有才认为连接已死。
+const idleTimeout = 3 * time.Minute
+
+// copyBufPool 复用中转缓冲，避免每条连接各分配一次。
+var copyBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 16*1024)
+		return &b
+	},
+}
+
+// copyFlow 在两条连接之间搬字节，每读到数据就把读超时往后推。
+//
+// 不用 io.Copy：目标是 *net.TCPConn 时它会走 ReadFrom 的 splice(2) 零拷贝，
+// 每次都要从内部池里取一对 pipe fd 当内核中转缓冲，并发冲高时这些管道会
+// 成对留在进程里不归还——线上见过只剩 13 条 socket 的进程占着 8210 个
+// pipe fd，跟 4096 的并发上限撞在同一个数字上。fd 被占住之后，DoT 解析和
+// 443 转发一起分不到 socket。
+func copyFlow(dst net.Conn, src io.Reader, srcConn net.Conn) {
+	bp := copyBufPool.Get().(*[]byte)
+	defer copyBufPool.Put(bp)
+	b := *bp
+	for {
+		if srcConn != nil {
+			_ = srcConn.SetReadDeadline(time.Now().Add(idleTimeout))
 		}
-		select {
-		case <-done:
-		case <-time.After(3 * time.Second):
+		n, err := src.Read(b)
+		if n > 0 {
+			if _, werr := dst.Write(b[:n]); werr != nil {
+				return
+			}
+		}
+		if err != nil {
+			return
 		}
 	}
+}
+
+// isSelfishIP 覆盖「不走网卡也会回到本机」的地址：回环、未指定、链路本地、组播。
+func isSelfishIP(ip net.IP) bool {
+	if ip == nil {
+		return false
+	}
+	return ip.IsLoopback() || ip.IsUnspecified() ||
+		ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsMulticast()
+}
+
+// docNets 是 RFC 5737 的文档保留段，测试与本地调试都拿它当假网关。
+var docNets = func() []*net.IPNet {
+	var out []*net.IPNet
+	for _, c := range []string{"192.0.2.0/24", "198.51.100.0/24", "203.0.113.0/24"} {
+		if _, n, err := net.ParseCIDR(c); err == nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}()
+
+// selfGuardOn 报告是否启用自环硬拦。
+// 网关是回环/私网/文档地址时（e2e 测试与本地调试）不启用：那里 127.0.0.1
+// 就是模拟的「海外目标」，按自环拦掉会让正常转发全废。
+func (s *snipSvc) selfGuardOn() bool {
+	gw := net.ParseIP(s.cfg.GatewayIP).To4()
+	if gw == nil || !gw.IsGlobalUnicast() || gw.IsPrivate() || gw.IsLoopback() {
+		return false
+	}
+	return !inNets(gw, docNets)
 }
 
 // isSelfTarget 判断转发目标会不会解析到网关自己（公网网关 IP）。
@@ -562,8 +655,17 @@ func (s *snipSvc) isSelfTarget(host string, remoteDNS []string) bool {
 	if gw == nil {
 		return false
 	}
+	guard := s.selfGuardOn()
 	for _, c := range candidates {
-		if c != nil && c.Equal(gw) {
+		if c == nil {
+			continue
+		}
+		if c.Equal(gw) {
+			return true
+		}
+		// 公网网关下，回环/未指定/链路本地目标一定是自环：::1、0.0.0.0、
+		// 127.0.0.2 这些连出去全都回到本机监听口，放一条就翻一倍。
+		if guard && isSelfishIP(c) {
 			return true
 		}
 	}

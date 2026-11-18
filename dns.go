@@ -12,10 +12,10 @@ import (
 )
 
 type dnsCache struct {
-	mu       sync.Mutex
-	m        map[string]cacheEntry
-	max      int
-	lazyTTL  time.Duration // 过期后的宽限期：期间仍用旧答案秒回，后台刷新
+	mu      sync.Mutex
+	m       map[string]cacheEntry
+	max     int
+	lazyTTL time.Duration // 过期后的宽限期：期间仍用旧答案秒回，后台刷新
 }
 
 type cacheEntry struct {
@@ -102,10 +102,10 @@ func (c *dnsCache) put(key string, msg *dns.Msg, cacheFor, origTTL uint32) {
 }
 
 type dnsSvc struct {
-	cfg   *Config
-	rules func() *RuleSet
-	dyn   *Dyn
-	nets  []*net.IPNet
+	cfg        *Config
+	rules      func() *RuleSet
+	dyn        *Dyn
+	nets       []*net.IPNet
 	cache      *dnsCache
 	refreshing sync.Map // key -> struct{}，陈旧刷新的去重，避免缓存击穿
 	// 启动时确定，避免每包解析
@@ -135,14 +135,19 @@ func (s *dnsSvc) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	q := req.Question[0]
 	name := strings.ToLower(strings.TrimSuffix(q.Name, "."))
 
+	var src net.IP
 	private := false
 	if ap, ok := w.RemoteAddr().(*net.TCPAddr); ok {
+		src = ap.IP
 		private = inNets(ap.IP, s.nets)
 	}
 
 	// 非托管来源一律按真实地址解析，保证不影响其它使用者。
+	// 但解析要带上它自己的网段：网关在境外，国内递归看到的是 VPS 的地址，
+	// 不带 ECS 就会把国内域名调度到海外节点（实测淘宝会回 155.102.x），
+	// 客户端照着直连就是「页面能开、内容拉不动」。
 	if !private {
-		s.forward(w, req, false)
+		s.forward(w, req, ecsFromSource(src))
 		return
 	}
 
@@ -153,7 +158,7 @@ func (s *dnsSvc) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		return
 	case dns.TypeA:
 	default:
-		s.forward(w, req, s.ecs != nil)
+		s.forward(w, req, s.ecs)
 		return
 	}
 
@@ -170,7 +175,7 @@ func (s *dnsSvc) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 		s.replyA(w, req, q, s.gatewayV4, s.cfg.SyntheticTTL)
 		return
 	default:
-		s.forward(w, req, s.ecs != nil)
+		s.forward(w, req, s.ecs)
 	}
 }
 
@@ -206,19 +211,19 @@ func attachEDNS(resp, req *dns.Msg) {
 	}
 }
 
-func (s *dnsSvc) forward(w dns.ResponseWriter, req *dns.Msg, useECS bool) {
-	key := cacheKey(req)
+func (s *dnsSvc) forward(w dns.ResponseWriter, req *dns.Msg, ecs net.IP) {
+	key := cacheKey(req, ecs)
 	if r, stale := s.cache.getWithStale(key); r != nil {
 		// 陈旧答案：用户秒回旧 IP，不等上游；后台去重刷新一次。
 		if stale {
-			s.refreshAsync(key, req, useECS)
+			s.refreshAsync(key, req, ecs)
 		}
 		r.Id = req.Id
 		_ = w.WriteMsg(r)
 		return
 	}
 
-	resp, err := s.exchange(req, useECS)
+	resp, err := s.exchange(req, ecs)
 	if err != nil {
 		logf("warn", "上游解析失败 q=%s: %v", req.Question[0].Name, err)
 		s.replyEmpty(w, req, dns.RcodeServerFailure)
@@ -241,13 +246,13 @@ func (s *dnsSvc) store(key string, resp *dns.Msg) {
 
 // refreshAsync 后台刷新陈旧缓存；同一 key 同时只允许一个刷新在跑，
 // 防止过期瞬间大量请求把上游打爆（缓存击穿）。
-func (s *dnsSvc) refreshAsync(key string, req *dns.Msg, useECS bool) {
+func (s *dnsSvc) refreshAsync(key string, req *dns.Msg, ecs net.IP) {
 	if _, loaded := s.refreshing.LoadOrStore(key, struct{}{}); loaded {
 		return
 	}
 	go func() {
 		defer s.refreshing.Delete(key)
-		resp, err := s.exchange(req, useECS)
+		resp, err := s.exchange(req, ecs)
 		if err != nil {
 			return // 保留旧答案，下次再试
 		}
@@ -284,14 +289,14 @@ func dnsRace(q *dns.Msg, ups []string, netw string, timeout time.Duration) *dns.
 	return nil
 }
 
-func (s *dnsSvc) exchange(req *dns.Msg, useECS bool) (*dns.Msg, error) {
+func (s *dnsSvc) exchange(req *dns.Msg, ecs net.IP) (*dns.Msg, error) {
 	_, local := s.dyn.DNS()
 	if len(local) == 0 {
 		local = s.cfg.LocalDNS
 	}
 	q := req
-	if useECS && s.ecs != nil {
-		q = withECS(req, s.ecs)
+	if ecs != nil {
+		q = withECS(req, ecs)
 	}
 
 	// 第一段：UDP 并发竞速，150ms 内谁先回用谁（对齐 mosdns threshold）。
@@ -344,12 +349,48 @@ func withECS(req *dns.Msg, ip net.IP) *dns.Msg {
 	return m
 }
 
-func cacheKey(m *dns.Msg) string {
+// ecsFromSource 把客户端来源折算成发给递归的 ECS 网段。
+// 只取 /24：够 CDN 定位到城域网，又不把单台设备暴露给上游；私网、回环、
+// 保留地址一律不带，免得塞给上游一个无效网段。
+func ecsFromSource(ip net.IP) net.IP {
+	v4 := ip.To4()
+	if v4 == nil || !isPublicV4(v4) {
+		return nil
+	}
+	return v4.Mask(net.CIDRMask(24, 32))
+}
+
+var nonPublicV4 = func() []*net.IPNet {
+	var out []*net.IPNet
+	for _, c := range []string{
+		"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+		"169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.0.2.0/24",
+		"192.168.0.0/16", "198.18.0.0/15", "198.51.100.0/24",
+		"203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
+	} {
+		if _, n, err := net.ParseCIDR(c); err == nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}()
+
+func isPublicV4(ip net.IP) bool {
+	return ip.To4() != nil && !inNets(ip, nonPublicV4)
+}
+
+// cacheKey 生成缓存键。带 ECS 时把网段一起编进去：不同网段拿到的 CDN
+// 节点不同，混用一个 key 会把别处的就近结果发给当前客户端。
+func cacheKey(m *dns.Msg, ecs net.IP) string {
 	if len(m.Question) == 0 {
 		return ""
 	}
 	q := m.Question[0]
-	return strings.ToLower(q.Name) + "|" + dns.TypeToString[q.Qtype]
+	k := strings.ToLower(q.Name) + "|" + dns.TypeToString[q.Qtype]
+	if ecs != nil {
+		k += "|" + ecs.String()
+	}
+	return k
 }
 
 func minTTL(m *dns.Msg) uint32 {

@@ -9,40 +9,34 @@ import (
 	"time"
 )
 
-// TestPumpTimeoutReleasesGoroutines 回归 fd 泄漏：
-// 客户端连上后既不发数据也不关闭（模拟 keep-alive 挂死），
-// 上游连上后立刻返回并关闭。旧版 pump 会卡在从客户端读的那路
-// io.Copy（客户端读 deadline 被清成永不过期），两路 done 无法
-// 同时到齐，pump 永不返回，goroutine + splice pipe 泄漏。
-// 新版 pump 必须在 timeout 内强制关闭两端并返回。
-func TestPumpTimeoutReleasesGoroutines(t *testing.T) {
+// TestPumpUpstreamCloseReleasesClient 回归 fd 泄漏：
+// 上游回完数据就关，客户端却挂着不发也不关（典型 keep-alive 短连接）。
+// pump 必须在任一路结束时把两端都关掉，否则上游那半条留在 CLOSE-WAIT，
+// 几百条一叠就是 accept: too many open files。
+func TestPumpUpstreamCloseReleasesClient(t *testing.T) {
 	before := runtime.NumGoroutine()
 
-	// 客户端：接到连接后什么都不做，也不关闭（挂死）。
 	clientLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer clientLn.Close()
-
-	// 上游：接受连接后立刻回一点数据再关闭，模拟已响应的远端。
 	upLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer upLn.Close()
 
-	clientDone := make(chan struct{})
+	held := make(chan struct{})
 	go func() {
 		c, e := clientLn.Accept()
 		if e != nil {
-			close(clientDone)
+			close(held)
 			return
 		}
-		defer c.Close()
-		<-clientDone // 测试结束前一直 held，绝不主动关闭写方向
+		<-held
+		c.Close()
 	}()
-
 	go func() {
 		u, e := upLn.Accept()
 		if e != nil {
@@ -61,35 +55,26 @@ func TestPumpTimeoutReleasesGoroutines(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	br := bufio.NewReaderSize(client, 32*1024)
 	finished := make(chan struct{})
 	go func() {
-		pump(br, upstream, client, 300*time.Millisecond)
+		pump(bufio.NewReaderSize(client, 32*1024), upstream, client)
 		close(finished)
 	}()
 
 	select {
 	case <-finished:
-		// 期望：pump 在 300ms 超时后强制关闭并返回
 	case <-time.After(3 * time.Second):
-		t.Fatal("pump 超时后仍未返回，goroutine 泄漏")
+		t.Fatal("上游结束后 pump 仍未返回，连接/goroutine 泄漏")
 	}
 
-	close(clientDone)
-	client.Close()
-	upstream.Close()
-
-	// 给调度器一点时间收敛
+	close(held)
 	time.Sleep(200 * time.Millisecond)
-	after := runtime.NumGoroutine()
-	if after > before+3 {
+	if after := runtime.NumGoroutine(); after > before+3 {
 		t.Fatalf("goroutine 疑似泄漏: before=%d after=%d", before, after)
 	}
 }
 
-// TestPumpClientCloseKillsUpstream 回归 fd 泄漏核心：客户端断开后，
-// 上游连接必须被完全关闭（不是半关闭），另一路 io.Copy 才能立即返回。
-// 这样 goroutine 和 splice pipe 才不会随 keep-alive 短连接累积。
+// TestPumpClientCloseKillsUpstream 客户端断开后，上游必须被完全关闭。
 func TestPumpClientCloseKillsUpstream(t *testing.T) {
 	before := runtime.NumGoroutine()
 
@@ -98,12 +83,11 @@ func TestPumpClientCloseKillsUpstream(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer upLn.Close()
-
-	upAccepted := make(chan net.Conn, 1)
 	go func() {
-		u, e := upLn.Accept()
-		if e == nil {
-			upAccepted <- u
+		if u, e := upLn.Accept(); e == nil {
+			// 什么都不发，模拟还没回包的上游
+			time.Sleep(3 * time.Second)
+			u.Close()
 		}
 	}()
 
@@ -115,59 +99,71 @@ func TestPumpClientCloseKillsUpstream(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	_ = upAccepted
 
 	finished := make(chan struct{})
 	go func() {
-		pump(bufio.NewReaderSize(client, 4096), upstream, client, 5*time.Second)
+		pump(bufio.NewReaderSize(client, 4096), upstream, client)
 		close(finished)
 	}()
 
-	// 客户端直接断开——模拟手机 keep-alive 短连接结束
 	time.Sleep(50 * time.Millisecond)
 	client.Close()
 
 	select {
 	case <-finished:
 	case <-time.After(2 * time.Second):
-		t.Fatal("客户端断开后 pump 未及时返回，上游连接泄漏")
+		t.Fatal("客户端断开后 pump 未及时返回")
 	}
 
-	// 上游连接应当已被关闭：再读应立即 EOF
 	_ = upstream.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
-	buf := make([]byte, 1)
-	if _, err := upstream.Read(buf); err == nil {
+	if _, err := upstream.Read(make([]byte, 1)); err == nil {
 		t.Fatal("客户端断开后上游连接仍未关闭")
 	}
 	upstream.Close()
 
 	time.Sleep(200 * time.Millisecond)
-	if after := runtime.NumGoroutine(); after > before+3 {
+	if after := runtime.NumGoroutine(); after > before+4 {
 		t.Fatalf("goroutine 泄漏: before=%d after=%d", before, after)
 	}
 }
 
-// TestPumpNormalCompletion 正常双向数据流应当即时结束，不受超时干扰。
-func TestPumpNormalCompletion(t *testing.T) {
-	c1, c2 := net.Pipe()
-	defer c1.Close()
-	defer c2.Close()
+// TestPumpCopiesBothDirections 双向数据都要原样搬过去，不能因为改造丢半条。
+func TestPumpCopiesBothDirections(t *testing.T) {
+	clientPeer, clientConn := net.Pipe()
+	upstreamConn, upstreamPeer := net.Pipe()
 
-	u1, u2 := net.Pipe()
-	defer u1.Close()
-	defer u2.Close()
+	go func() { _, _ = io.WriteString(clientPeer, "REQ") }()
+	go func() { _, _ = io.WriteString(upstreamPeer, "RESP") }()
 
-	go func() { _, _ = io.WriteString(c1, "GET / HTTP/1.0\r\n\r\n") }()
-	go func() { _, _ = io.WriteString(u2, "HTTP/1.0 200 OK\r\n\r\nhi") }()
-
-	done := make(chan struct{})
+	finished := make(chan struct{})
 	go func() {
-		pump(bufio.NewReaderSize(c2, 4096), u1, c2, 2*time.Second)
-		close(done)
+		pump(bufio.NewReaderSize(clientConn, 4096), upstreamConn, clientConn)
+		close(finished)
 	}()
+
+	gotReq := make([]byte, 3)
+	_ = upstreamPeer.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(upstreamPeer, gotReq); err != nil {
+		t.Fatalf("上游没收到请求: %v", err)
+	}
+	if string(gotReq) != "REQ" {
+		t.Fatalf("上游收到 %q", gotReq)
+	}
+
+	gotResp := make([]byte, 4)
+	_ = clientPeer.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if _, err := io.ReadFull(clientPeer, gotResp); err != nil {
+		t.Fatalf("客户端没收到响应: %v", err)
+	}
+	if string(gotResp) != "RESP" {
+		t.Fatalf("客户端收到 %q", gotResp)
+	}
+
+	clientPeer.Close()
+	upstreamPeer.Close()
 	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("正常数据流下 pump 未及时结束")
+	case <-finished:
+	case <-time.After(2 * time.Second):
+		t.Fatal("两端关闭后 pump 未返回")
 	}
 }
