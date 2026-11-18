@@ -15,6 +15,53 @@ ok()   { printf "${GREEN}[ OK ]${NC} %s\n" "$*"; }
 warn() { printf "${YELLOW}[WARN]${NC} %s\n" "$*"; }
 err()  { printf "${RED}[ERR ]${NC} %s\n" "$*" >&2; }
 
+# GitHub 在部分机房会被阻断、限速，或者 DNS 被投毒。
+# 所有下载都走 dl()：直连优先，失败再按镜像顺序试，
+# 全部失败时把每一条的真实原因列出来 —— 只打「下载失败」四个字，
+# 等于让人去猜是 DNS、超时还是 TLS。
+# 想换镜像：GITHUB_MIRRORS="https://xxx/" bash install.sh
+GITHUB_MIRRORS="${GITHUB_MIRRORS:-https://ghfast.top/,https://gh-proxy.com/,https://ghproxy.net/}"
+DL_DIAG=""
+
+# curl 退出码转人话。这几个码是排查时唯一有效的信息，别丢。
+curl_err() {
+    case "$1" in
+        5)  printf '代理地址无法解析' ;;
+        6)  printf 'DNS 解析失败' ;;
+        7)  printf '连不上（不可达或被拒）' ;;
+        22) printf 'HTTP 错误（404，或被中间层拒绝）' ;;
+        28) printf '超时' ;;
+        35) printf 'TLS 握手失败（系统时间不对，或被中间人拦）' ;;
+        52) printf '服务器没返回任何数据' ;;
+        56) printf '连接被重置' ;;
+        60) printf 'CA 证书不可信（ca-certificates 过期或缺）' ;;
+        *)  printf 'curl 退出码 %s' "$1" ;;
+    esac
+}
+
+# dl <目标文件> <GitHub 原始 URL> [超时秒]
+dl() {
+    local out="$1" url="$2" tmo="${3:-180}" p rc
+    DL_DIAG=""
+    for p in "" ${GITHUB_MIRRORS//,/ }; do
+        rc=0
+        curl -fsSL --connect-timeout 8 --max-time "$tmo" --retry 2 --retry-delay 2 \
+             -o "$out" "${p}${url}" 2>/dev/null || rc=$?
+        if [[ $rc -eq 0 && -s "$out" ]]; then
+            [[ -n "$p" ]] && info "下载走镜像 ${p%/}"
+            return 0
+        fi
+        DL_DIAG+="      ${p:-直连}  →  $(curl_err "$rc")"$'\n'
+    done
+    return 1
+}
+
+# 镜像不通时可能回一张 HTML 错误页，sed 会从里面刮出乱七八糟的片段。
+# 只认 vX.Y[.Z]，其余一律当没拿到。
+norm_tag() {
+    [[ "$1" =~ ^v?[0-9]+\.[0-9]+ ]] && printf '%s' "$1"
+}
+
 # curl … | bash 时 stdin 被脚本正文自身占着，read 会读到脚本内容而不是键盘输入，
 # 于是域名会变成一个莫名其妙的片段。所有交互统一从 /dev/tty 读。
 # 拿不到终端（CI / 无 tty）就返回空，交给后面的参数校验给出明确报错。
@@ -34,6 +81,7 @@ usage() {
 
   不带参数        未安装则安装；已安装则检查新版本，有就升级
   --force         已安装时不看版本，直接重装当前最新版（修损坏/换回退版用）
+  --diag          只做出网自检：DNS、时间、TLS、GitHub 与镜像可达性，不改任何东西
   -h, --help      显示本帮助
 
 常用环境变量：
@@ -43,13 +91,18 @@ usage() {
   GATEWAY_IP=172.22.2.1        网关地址（默认自动探测）
   SOCKS5=user:pass@host:port   额外加一个 socks5 出口
   TG_TOKEN=... TG_ADMINS=...   Telegram 控制台
+  GITHUB_MIRRORS=...           下载镜像，逗号分隔（机房直连 GitHub 不通时用）
+  LOCAL_BIN=/root/dotmux-linux-amd64
+                               用本地文件当新二进制，跳过下载（完全没网时用）
 EOF
 }
 
 FORCE=0
+DIAG=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --force)    FORCE=1 ;;
+        --diag)     DIAG=1 ;;
         -h|--help)  usage; exit 0 ;;
         *)          err "未知参数: $1"; usage; exit 1 ;;
     esac
@@ -123,6 +176,85 @@ ver_gt() {
     [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" == "$1" ]]
 }
 
+# ---------- 出网自检 ----------
+# 「连不上 GitHub」有六种原因，处理方式完全不同：DNS 投毒、TLS 时间、
+# 机房封端口、代理变量残留、CA 证书缺失、以及真的没网。一次性打清楚，
+# 比来回试脚本快得多。只读，不改任何东西。
+probe() {
+    local label="$1" url="$2" flag="${3:-}" out rc
+    # flag 为空时不能展开成空参数以外的东西，所以走两个分支而不是 $flag
+    if [[ -n "$flag" ]]; then
+        out=$(curl "$flag" -fsSL --connect-timeout 6 --max-time 12 -o /dev/null \
+              -w '%{http_code} %{time_total}s' "$url" 2>&1) || rc=$?
+    else
+        out=$(curl -fsSL --connect-timeout 6 --max-time 12 -o /dev/null \
+              -w '%{http_code} %{time_total}s' "$url" 2>&1) || rc=$?
+    fi
+    rc="${rc:-0}"
+    if [[ "$rc" -eq 0 ]]; then
+        printf '  %-22s OK    %s\n' "$label" "$out"
+    else
+        printf '  %-22s ✗     %s\n' "$label" "$(curl_err "$rc")"
+    fi
+    return 0
+}
+
+diag() {
+    local arch dns proxy_env
+    # 自检不能自己把自己搞崩：容器里 common 缺 /etc/resolv.conf、精简系统没 timedatectl，
+    # 一律当「查不到」继续往下走。
+    arch=$(arch_of 2>/dev/null || true)
+    dns=$(awk '/^nameserver/{printf "%s ", $2}' /etc/resolv.conf 2>/dev/null | sed 's/ $//' || true)
+    proxy_env=$(env | grep -iE '^(http|https|all|no)_proxy=' | tr '\n' ' ' 2>/dev/null || true)
+
+    echo "dotmux 出网自检（只读，不改任何东西）"
+    echo "--------------------------------------"
+    printf '  时间(UTC)   : %s\n' "$(date -u '+%F %T')"
+    printf '  NTP 同步    : %s\n' "$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo 未知)"
+    printf '  架构        : %s → %s\n' "$(uname -m)" "${arch:-不支持}"
+    if [[ -s /etc/ssl/certs/ca-certificates.crt ]]; then
+        printf '  CA 证书     : 有\n'
+    else
+        printf '  CA 证书     : 缺失 ← TLS 必然失败，先 apt-get install -y ca-certificates\n'
+    fi
+    printf '  DNS 服务器  : %s\n' "${dns:-（空，说明 /etc/resolv.conf 没配置）}"
+    if [[ -n "$proxy_env" ]]; then
+        printf '  代理变量    : %s ← 残留的代理会劫持 curl，先 unset 掉再试\n' "$proxy_env"
+    else
+        printf '  代理变量    : 无\n'
+    fi
+
+    echo
+    echo "连通性："
+    probe "github.com (v4)"     https://github.com -4
+    probe "github.com (v6)"     https://github.com -6
+    probe "api.github.com"      https://api.github.com
+    probe "raw.githubusercontent" https://raw.githubusercontent.com
+    echo "  镜像："
+    local p
+    for p in ${GITHUB_MIRRORS//,/ }; do
+        probe "${p%/}" "${p}https://github.com/${REPO}/releases/latest"
+    done
+
+    echo
+    echo "解析结果："
+    # 精简系统可能没 getent，不能让它把自检本身搞崩
+    getent ahostsv4 github.com 2>/dev/null | awk '{print "  github.com → " $1}' | sort -u | head -4 || true
+    getent ahostsv4 api.github.com 2>/dev/null | awk '{print "  api.github.com → " $1}' | sort -u | head -2 || true
+
+    echo
+    echo "判断："
+    echo "  v4 通、v6 失败            → 只是 IPv6 没路由，不影响，脚本走 v4"
+    echo "  全部 DNS 解析失败         → 换 DNS：echo 'nameserver 1.1.1.1' > /etc/resolv.conf"
+    echo "  全部 TLS 握手失败         → 时间不对：timedatectl set-ntp true"
+    echo "  github 通、api 不通       → releases 还能下，脚本会自动退到网页重定向"
+    echo "  全都连不上、镜像也不通    → 机房封了，用 LOCAL_BIN 离线装"
+    echo
+    echo "离线装法（在别处下好再传上来）："
+    echo "  https://github.com/${REPO}/releases/latest/download/dotmux-linux-${arch:-amd64}"
+    echo "  sudo LOCAL_BIN=/root/dotmux-linux-${arch:-amd64} bash install.sh"
+}
+
 # 取最新标签：网页重定向和 API 两条路都问，取较高的那个。
 #
 # 只用网页重定向不够：它走 CDN 有缓存。刚打完 tag 立刻跑升级，那边可能
@@ -130,12 +262,21 @@ ver_gt() {
 # API 不缓存、当场就是新的，但匿名调用有 60 次/小时配额，所以两条都留着，
 # 谁新用谁；两个都拿不到就返回空，由调用方决定本次不升级。
 latest_tag() {
-    local web="" api=""
-    web=$(curl -fsSIL --max-time 20 -o /dev/null -w '%{url_effective}' \
-        "https://github.com/${REPO}/releases/latest" 2>/dev/null | sed -n 's#.*/tag/##p')
-    api=$(curl -fsS --max-time 20 -H 'Accept: application/vnd.github+json' \
-        "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
-        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    local web="" api="" p t
+    for p in "" ${GITHUB_MIRRORS//,/ }; do
+        if [[ -z "$web" ]]; then
+            t=$(curl -fsSIL --connect-timeout 6 --max-time 15 -o /dev/null -w '%{url_effective}' \
+                "${p}https://github.com/${REPO}/releases/latest" 2>/dev/null | sed -n 's#.*/tag/##p')
+            web=$(norm_tag "$t")
+        fi
+        if [[ -z "$api" ]]; then
+            t=$(curl -fsS --connect-timeout 6 --max-time 15 -H 'Accept: application/vnd.github+json' \
+                "${p}https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
+                | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+            api=$(norm_tag "$t")
+        fi
+        [[ -n "$web" && -n "$api" ]] && break
+    done
     if [[ -z "$web" ]]; then printf '%s' "$api"; return; fi
     if [[ -z "$api" ]]; then printf '%s' "$web"; return; fi
     if ver_gt "${web#v}" "${api#v}"; then
@@ -146,25 +287,53 @@ latest_tag() {
 }
 
 upgrade_if_needed() {
-    local force="$1" cur latest arch base url tmp newbin
+    local force="$1" cur latest arch base url tmp newbin offline=0
     MODE=upgrade
     cur=$("$BIN" -version 2>/dev/null | awk '{print $2}')
     cur="${cur:-dev}"
-    info "已安装：${cur}，检查是否有新版本..."
 
-    latest="${LATEST:-}"
-    [[ -n "$latest" ]] || latest=$(latest_tag)
-    if [[ -z "$latest" ]]; then
-        warn "查不到最新版本（网络或 GitHub 不可达），本次跳过"
-        echo "  当前版本：${cur}"
-        echo "  网络恢复后重跑本脚本即可；只想重装当前版：sudo bash install.sh --force"
-        return 0
+    # 离线模式：给了本地包就直接装它。这里必须绕开版本探测 ——
+    # 会用这个开关的场合就是「本机根本连不上 GitHub」，版本号自然查不到；
+    # 也不能让它参与版本比较，否则拿到的包比当前旧就白传了。
+    if [[ -n "${LOCAL_BIN:-}" ]]; then
+        [[ -s "$LOCAL_BIN" ]] || { err "LOCAL_BIN 指向的文件不存在或为空：$LOCAL_BIN"; return 1; }
+        offline=1
+        force=1
+        latest="local"
+        info "离线模式：使用 ${LOCAL_BIN}（当前 ${cur}）"
     fi
 
-    # dev 是本地构建或旧版没注入版本号，无从比较，直接当需要升级
-    if [[ "$force" -eq 0 && "$cur" != "dev" ]] && ! ver_gt "${latest#v}" "${cur#v}"; then
-        ok "已是最新版本 ${latest}，无需升级"
-        return 0
+    if [[ "$offline" -eq 0 ]]; then
+        info "已安装：${cur}，检查是否有新版本..."
+        latest="${LATEST:-}"
+        [[ -n "$latest" ]] || latest=$(latest_tag)
+        if [[ -z "$latest" ]]; then
+            warn "查不到最新版本：本机连不上 GitHub（直连和镜像都试过了）"
+            echo "  当前版本：${cur}，保持不动"
+            cat <<EOF
+
+  先确认断在哪：
+    sudo bash install.sh --diag
+
+  常见三种原因：
+    1) 这台机器出网被限（机房封 GitHub）→ 换镜像重试
+         sudo GITHUB_MIRRORS="https://你的镜像/" bash install.sh
+    2) 系统时间不对 → TLS 握手就失败（--diag 会直接指出）
+         sudo apt-get install -y chrony && timedatectl set-ntp true
+    3) 环境里残留了代理变量（http_proxy / all_proxy）而代理已经没了
+         env | grep -i proxy
+
+  完全没网也能升：在别处下好二进制，scp 上来后
+    sudo LOCAL_BIN=/root/dotmux-linux-amd64 bash install.sh
+EOF
+            return 0
+        fi
+
+        # dev 是本地构建或旧版没注入版本号，无从比较，直接当需要升级
+        if [[ "$force" -eq 0 && "$cur" != "dev" ]] && ! ver_gt "${latest#v}" "${cur#v}"; then
+            ok "已是最新版本 ${latest}，无需升级"
+            return 0
+        fi
     fi
 
     arch=$(arch_of)
@@ -175,18 +344,61 @@ upgrade_if_needed() {
 
     base="${RELEASE_BASE:-https://github.com/${REPO}/releases}"
     url="$base/download/${latest}/dotmux-linux-${arch}"
-    STEP="升级到 ${latest}"
-
-    info "下载 ${latest}（linux-${arch}）..."
-    tmp=$(mktemp -d)
-    newbin="$tmp/dotmux-linux-${arch}"
-    if ! curl -fsSL --max-time 600 --retry 3 --retry-delay 2 -o "$newbin" "$url"; then
-        err "下载失败，当前版本 ${cur} 保持不变"
-        rm -rf "$tmp"
-        return 1
+    if [[ "$offline" -eq 1 ]]; then
+        STEP="安装本地二进制"
+    else
+        STEP="升级到 ${latest}"
     fi
 
-    if curl -fsSL --max-time 30 -o "${newbin}.sha256" "${url}.sha256" 2>/dev/null \
+    tmp=$(mktemp -d)
+    newbin="$tmp/dotmux-linux-${arch}"
+
+    if [[ "$offline" -eq 1 ]]; then
+        # 机房封 GitHub、或者只想把手上的包装上去时的逃生口。
+        info "使用本地二进制：${LOCAL_BIN}（跳过下载）"
+        if ! cp -f "$LOCAL_BIN" "$newbin"; then
+            err "复制 ${LOCAL_BIN} 失败"
+            rm -rf "$tmp"
+            return 1
+        fi
+    else
+        info "下载 ${latest}（linux-${arch}）..."
+        if ! dl "$newbin" "$url" 600; then
+            err "下载失败，当前版本 ${cur} 保持不变"
+            printf '%s' "$DL_DIAG" >&2
+            cat >&2 <<EOF
+
+  三行分别是直连和各镜像的失败原因。针对性处理：
+    · DNS 解析失败      → cat /etc/resolv.conf，换个能用 53 的 DNS
+    · TLS 握手失败      → 多半系统时间不对：timedatectl status
+    · 超时 / 连不上     → 机房封了 GitHub，换镜像：
+        sudo GITHUB_MIRRORS="https://你的镜像/" bash install.sh
+    · 环境里残留代理    → env | grep -i proxy，有就 unset 掉再跑
+
+  完全没网也能升：在能上网的机器下载
+    https://github.com/${REPO}/releases/download/${latest}/dotmux-linux-${arch}
+  scp 到这台机器，然后
+    sudo LOCAL_BIN=/root/dotmux-linux-${arch} bash install.sh
+EOF
+            rm -rf "$tmp"
+            return 1
+        fi
+    fi
+
+    if [[ "$offline" -eq 1 ]]; then
+        # 离线时没网可下校验文件；有同名 .sha256 就用本地的验。
+        if [[ -s "${LOCAL_BIN}.sha256" ]]; then
+            if ! (cd "$tmp" && cp -f "${LOCAL_BIN}.sha256" "dotmux-linux-${arch}.sha256" \
+                  && sha256sum -c "dotmux-linux-${arch}.sha256" >/dev/null 2>&1); then
+                err "sha256 校验不通过，文件可能不完整，已中止（当前版本不变）"
+                rm -rf "$tmp"
+                return 1
+            fi
+            ok "sha256 校验通过"
+        else
+            warn "本地二进制没有 .sha256，跳过校验"
+        fi
+    elif curl -fsSL --connect-timeout 6 --max-time 30 -o "${newbin}.sha256" "${url}.sha256" 2>/dev/null \
         && [[ -s "${newbin}.sha256" ]]; then
         if ! (cd "$tmp" && sha256sum -c "dotmux-linux-${arch}.sha256" >/dev/null 2>&1); then
             err "sha256 校验不通过，文件可能不完整，已中止（当前版本不变）"
@@ -231,7 +443,11 @@ upgrade_if_needed() {
     fi
     rm -f "${BIN}.bak"
 
-    ok "已升级到 ${latest}"
+    if [[ "$offline" -eq 1 ]]; then
+        ok "已换成本地二进制"
+    else
+        ok "已升级到 ${latest}"
+    fi
     "$BIN" -version 2>/dev/null || true
     echo "  配置、规则、证书都原样保留，没有重新签发"
     echo "  要退回旧版：sudo bash install.sh --force（会装上最新版，旧版请手动放回）"
@@ -264,6 +480,13 @@ ensure_service_running() {
     journalctl -u dotmux -n 30 --no-pager 2>/dev/null || true
     return 1
 }
+
+# --diag 在这里就退出。后面的分支会装依赖、签证书、动 systemd，
+# 一个只用来排查网络的开关不该碰这些。
+if [[ "$DIAG" -eq 1 ]]; then
+    diag
+    exit 0
+fi
 
 # 装过就只做升级检查，不再重复装依赖、签证书
 if [[ -x "$BIN" && -f "$CONF" ]]; then
@@ -402,16 +625,11 @@ install_mihomo() {
     local name="mihomo-linux-${arch}-v${MIHOMO_VERSION}"
     local base="https://github.com/MetaCubeX/mihomo/releases/download/v${MIHOMO_VERSION}"
     local tmp; tmp="$(mktemp -d)"
-    local okdl=0
-    # 先直连，失败再走镜像
-    for prefix in "" "https://ghfast.top/"; do
-        if curl -fL --max-time 180 -o "${tmp}/m.gz" "${prefix}${base}/${name}.gz" 2>/dev/null; then
-            okdl=1; break
-        fi
-    done
-    if [[ "$okdl" != "1" ]]; then
+    if ! dl "${tmp}/m.gz" "${base}/${name}.gz" 240; then
         rm -rf "$tmp"
-        warn "mihomo 下载失败，跳过（出口暂时只能用 direct / socks5，稍后可手动安装）"
+        warn "mihomo 下载失败（直连与镜像都不通），跳过"
+        printf '%s' "$DL_DIAG" >&2
+        echo "  出口暂时只能用 direct / socks5；网络恢复后重跑本脚本会补装。" >&2
         return 0
     fi
     gunzip -f "${tmp}/m.gz" || { rm -rf "$tmp"; warn "解压 mihomo 失败"; return 0; }
@@ -475,13 +693,25 @@ info "安装二进制..."
 if [[ -x "$(dirname "$0")/dotmux" ]]; then
     install -m 0755 "$(dirname "$0")/dotmux" "$BIN"
     ok "使用本地构建的二进制"
+elif [[ -n "${LOCAL_BIN:-}" ]]; then
+    install -m 0755 "$LOCAL_BIN" "$BIN"
+    ok "使用本地二进制：$LOCAL_BIN"
 else
-    URL="https://github.com/$REPO/releases/latest/download/dotmux-linux-$ARCH"
-    if curl -fsSL --max-time 60 "$URL" -o "$BIN.tmp"; then
+    URL="https://github.com/$REPO/releases/${LATEST:-latest}/download/dotmux-linux-$ARCH"
+    # latest 为空时退回 /releases/latest/download 这条固定路径
+    [[ -n "${LATEST:-}" ]] || URL="https://github.com/$REPO/releases/latest/download/dotmux-linux-$ARCH"
+    if dl "$BIN.tmp" "$URL" 300; then
         install -m 0755 "$BIN.tmp" "$BIN" && rm -f "$BIN.tmp"
         ok "已下载 $ARCH 版本"
     else
-        err "下载失败。请先在本地 go build 后同目录执行本脚本，或先发一个 Release。"
+        err "下载失败：本机连不到 GitHub"
+        printf '%s' "$DL_DIAG" >&2
+        cat >&2 <<EOF
+
+  换镜像：sudo GITHUB_MIRRORS="https://你的镜像/" bash install.sh
+  离线：  sudo LOCAL_BIN=/root/dotmux-linux-$ARCH bash install.sh
+  先自检：sudo bash install.sh --diag
+EOF
         exit 1
     fi
 fi

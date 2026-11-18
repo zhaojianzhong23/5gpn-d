@@ -87,11 +87,38 @@ sudo bash install.sh
 | 没装过 | 走完整安装 |
 | 已装、有新版本 | 只下载新二进制 → sha256 校验 → 替换 → 重启，**不碰配置、规则、证书** |
 | 已装、已是最新 | 打印 `已是最新版本 vX.Y.Z` 后退出 |
-| 查不到版本（断网 / GitHub 不通） | 不升级，提示稍后重试，正在跑的服务不受影响 |
+| 查不到版本（断网 / GitHub 不通） | 不升级，打印断在哪一步和三种处理办法，正在跑的服务不受影响 |
 
 升级过程中是原子的：新二进制先写成 `dotmux.new`，确认能执行后再 rename 覆盖（直接覆盖正在运行的文件会 `Text file busy`）。旧版留一份 `dotmux.bak`，重启后 2 秒内没起来就自动回滚，并打出 `journalctl` 最后 30 行。
 
 `--force` 跳过版本判断，直接重装最新版——二进制损坏或想手动换版本时用。`dev` 版本（本地 `go build`，没注入版本号）一律当作需要升级。
+
+#### GitHub 连不上怎么办
+
+机房封 GitHub、DNS 被投毒、系统时间不对，表现都是同一句「下载失败」。先自检，它只读、不改任何东西：
+
+```bash
+sudo bash install.sh --diag
+```
+
+会逐项打出：系统时间与 NTP 同步状态、CA 证书是否缺失、`/etc/resolv.conf` 里的 DNS、**残留的 `http_proxy` 环境变量**（很常见：代理早没了，变量还留着，curl 全被劫持），以及 `github.com`（v4 / v6 分开测）、`api.github.com`、`raw.githubusercontent.com` 和各镜像的 HTTP 状态码与耗时。
+
+确认是 GitHub 被封就换路径，三种由轻到重：
+
+```bash
+# 1) 走镜像下载二进制（脚本内置了 ghfast / gh-proxy / ghproxy 三个，自动逐个试）
+sudo GITHUB_MIRRORS="https://ghfast.top/" bash install.sh
+
+# 2) 连脚本本身都拉不下来时，脚本也走镜像
+curl -fsSL https://ghfast.top/https://raw.githubusercontent.com/zhaojianzhong23/5gpn-d/main/install.sh -o install.sh
+
+# 3) 彻底没网：在能上网的机器下好，scp 上来后离线装
+#    https://github.com/zhaojianzhong23/5gpn-d/releases/latest/download/dotmux-linux-amd64
+sudo LOCAL_BIN=/root/dotmux-linux-amd64 bash install.sh
+```
+
+`LOCAL_BIN` 会跳过版本探测（本来就查不到版本），直接装这个文件；同目录下有同名 `.sha256` 就顺手校验，没有则跳过。
+
 
 ### 卸载
 
