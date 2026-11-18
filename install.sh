@@ -482,13 +482,13 @@ else
   "client_cidr": ["$CLIENT_CIDR"],
   "ecs": "${ECS:-139.226.48.1}",
   "remote_dns": ["1.1.1.1", "8.8.8.8", "9.9.9.9"],
-  "local_dns": ["101.226.4.6", "218.30.118.6", "180.76.76.76", "119.29.29.29"],
+  "local_dns": ["223.5.5.5:53", "119.29.29.29:53", "223.6.6.6:53"],
   "mihomo_bin": "/usr/local/bin/mihomo",
   "exits": $EXITS_JSON,
   "default_exit": "$DEF_EXIT",
   "routing_enabled": true,
   "rules_file": "$RULES",
-  "cache_size": 8192,
+  "cache_size": 32768,
   "synthetic_ttl": 60,
   "cache_min_ttl": 600,
   "lazy_ttl": 300,
@@ -503,6 +503,20 @@ else
         "format": "domain",
         "prefix": "DOMAIN-SUFFIX",
         "action": "proxy"
+      },
+      {
+        "name": "proxy",
+        "url": "https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/proxy.txt",
+        "format": "clash",
+        "prefix": "DOMAIN-SUFFIX",
+        "action": "proxy"
+      },
+      {
+        "name": "cn",
+        "url": "https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/direct.txt",
+        "format": "clash",
+        "prefix": "DOMAIN-SUFFIX",
+        "action": "direct"
       }
     ]
   },
@@ -525,19 +539,37 @@ else
     cat > "$RULES" <<'EOF'
 # 格式：类型,值,动作   动作 = direct | proxy | block
 # 未命中任何规则时走 FINAL。
+#
+# 这里用的是【白名单模型】：点名直连的走直连，其余全走代理。
+# 反过来写（FINAL,direct 加一份墙外黑名单）看着省事，实际用不了——黑名单只要
+# 漏一条，那个站就直连出不去，而且表现为「偶尔打不开」，极难定位。
+# 远程表由 /etc/dotmux/config.json 里的 rules.remote 拉取：gfw + proxy（走代理）
+# 与 cn（直连）三份合并，这里只放几条兜底，免得首次启动、远程表还没下来时
+# 国内站点被绕到代理上。
 
+# —— 必须直连 ——
+DOMAIN-SUFFIX,cn,direct
+DOMAIN-SUFFIX,com.cn,direct
+DOMAIN-SUFFIX,net.cn,direct
+DOMAIN-SUFFIX,org.cn,direct
+
+# —— 点名走代理 ——
 DOMAIN-SUFFIX,openai.com,proxy
 DOMAIN-SUFFIX,anthropic.com,proxy
 DOMAIN-SUFFIX,youtube.com,proxy
 DOMAIN-SUFFIX,googlevideo.com,proxy
 DOMAIN-SUFFIX,twitter.com,proxy
+DOMAIN-SUFFIX,x.com,proxy
 DOMAIN-SUFFIX,telegram.org,proxy
 DOMAIN-SUFFIX,github.com,proxy
 DOMAIN-KEYWORD,doubleclick,block
 # 指定出口：proxy:出口名（出口名在 Bot 的「出口管理」里能看到）
 # DOMAIN-SUFFIX,netflix.com,proxy:香港
 
-FINAL,direct
+# 推送（APNs/FCM）、邮件（IMAP/SMTP/POP）、STUN 这类不走 80/443 的域名，
+# 由程序内置白名单强制直连，不需要写在这里；要补自己的写 config 的 no_proxy。
+
+FINAL,proxy
 EOF
     ok "已写入示例规则 $RULES（按需修改）"
 fi

@@ -25,6 +25,7 @@ iPhone/Android ── DoT :853 ──► dotmux ──► 国内域名：返回�
 | 多出口 | `exits[]` 可放任意多个出口：`direct`、`socks5`，或直接粘 **ss / vmess / vless / trojan / hysteria2 / tuic / anytls** 分享链接（由内置 mihomo 落地）；规则用 `proxy:名字` 精确指定，默认出口 Bot 里一键切换 |
 | 规则 | 本地文件 + 定时拉取远程规则源（clash / domain / gfwlist / dnsmasq），格式猜错自动换着试，失败回退上次缓存 |
 | 控制 | Telegram 面板：状态、出口增删改查与探测、规则与规则集增删、分类映射、DNS/域名/证书、日志、重启 |
+| 直连白名单 | 推送（APNs 5223 / FCM 5228）、邮件（IMAP/SMTP/POP）、STUN 这类不走 80/443 的域名强制直连，否则会被解析成网关地址、连到没人监听的端口（通知不来、邮件报账户错误） |
 | 边界 | 只接管 `client_cidr` 内的来源，其它来源按真实地址解析，不影响别人 |
 | 热更新 | 规则、出口、DNS、分流开关改完立即生效；证书每次握手重新读文件，certbot 续期后无需重启 |
 
@@ -127,7 +128,8 @@ sudo bash uninstall.sh
 | `mihomo_bin` | 代理内核路径，默认 `/usr/local/bin/mihomo`；只用 direct / socks5 时可以不装 |
 | `default_exit` | 默认出口名；`direct` 规则之外的流量都走这里 |
 | `routing_enabled` | 分流开关，关掉等于全部走默认出口 |
-| `cache_size` / `synthetic_ttl` | DNS 缓存条数 / 改写记录 TTL |
+| `cache_size` / `synthetic_ttl` | DNS 缓存条数 / 改写记录 TTL。缓存满了按采样淘汰（近似 LRU），不会整体清空——整表清空会让所有域名同时回到未命中，跨境回源一起卡 |
+| `no_proxy[]` | 额外的「必须直连」域名，写法同规则（裸域名、`DOMAIN,`、`DOMAIN-SUFFIX,`、`DOMAIN-KEYWORD,`）。内置的推送 / 邮件 / STUN 白名单见 `noproxy.go` |
 | `cache_min_ttl` | 直连记录在网关侧的最短缓存秒数，默认 600；对外作答的 TTL 仍不超过上游原值，客户端行为不变 |
 | `rules.remote[]` | 远程规则源：`url`、`format`、`prefix`、`action`（可为 `proxy:出口名`）、`name` |
 | `rules.refresh_hours` | 自动刷新间隔，默认 24 |
@@ -169,11 +171,12 @@ DOMAIN,exact.example.com,direct
 DOMAIN-SUFFIX,openai.com,proxy
 DOMAIN-SUFFIX,netflix.com,proxy:香港
 DOMAIN-KEYWORD,doubleclick,block
-FINAL,direct
+FINAL,proxy
 ```
 
 - `proxy` = 走默认出口；`proxy:香港` = 走指定出口；`direct` = 本地直出；`block` = NXDOMAIN。
 - 本地规则永远排在远程规则前面：你手写的判断优先于自动下载的表。
+- **直连白名单最先判定**：推送、邮件、STUN 这些域名即使被 gfw 的大后缀规则扫进去，也照样直连。要补自己的，写 `no_proxy`。
 - `IP-CIDR` / `GEOIP` / `RULE-SET` 会被跳过并在日志点名——本网关在 DNS 层只按域名决策。
 - 改完不用重启：Bot 里点「更新规则」，或 `systemctl reload dotmux`。
 
@@ -208,12 +211,17 @@ FINAL,direct
 - 十万条规则下单次查询约 **56 ns**（benchmark 实测），不会成为 DNS 瓶颈；
 - 启动**只读缓存不联网**，网络慢/挂掉也能秒起；后台再拉，拉完通知 Bot。
 
-默认只配了 `gfw.txt` 一个源。国内列表（`china-list.txt`，十万条直连）只在把 `FINAL` 改成 `proxy` 时才有意义——`FINAL,direct` 时未命中的域名本来就直连。
+安装脚本默认配三个源，对应**白名单模型**：
 
-```jsonc
-{ "name": "china", "url": "https://raw.githubusercontent.com/Loyalsoldier/v2ray-rules-dat/release/china-list.txt",
-  "format": "domain", "prefix": "DOMAIN-SUFFIX", "action": "direct" }
-```
+| 源 | 动作 | 作用 |
+|---|---|---|
+| `gfw.txt` | `proxy` | 被墙域名 |
+| `proxy.txt`（clash-rules） | `proxy` | 国外常用域名，补 gfw 漏项 |
+| `direct.txt`（clash-rules） | `direct` | 国内域名，点名直连 |
+
+配上 `FINAL,proxy`，未命中的域名走默认出口。**不要用 `FINAL,direct` 加一份
+墙外黑名单**：黑名单漏一条，那个站就直连出不去，症状是「偶尔打不开」，
+而且时好时坏、极难定位。白名单模型的代价只是国内漏项会绕一趟代理，站点照样能用。
 
 国内访问 GitHub 慢的话，在 URL 前面加一层镜像即可（如 `https://ghfast.top/` + 原始地址）。镜像挂了会自动回退到上次缓存。
 

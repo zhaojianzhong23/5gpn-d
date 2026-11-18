@@ -12,10 +12,10 @@ import (
 
 // Config 是 /etc/dotmux/config.json 的结构。
 type Config struct {
-	Listen    Listen `json:"listen"`
-	Domain    string `json:"domain"`
-	CertFile  string `json:"cert_file"`
-	KeyFile   string `json:"key_file"`
+	Listen   Listen `json:"listen"`
+	Domain   string `json:"domain"`
+	CertFile string `json:"cert_file"`
+	KeyFile  string `json:"key_file"`
 	// ACMEWebroot 是 80 端口上 /.well-known/acme-challenge/ 的取文件目录。
 	// 有它就不用为了续期停服务：certbot 走 --webroot，dotmux 自己把 challenge 吐出去，
 	// 不会出现「按 Host 转发 → 转给自己 → 死循环」。
@@ -32,26 +32,30 @@ type Config struct {
 	LocalDNS    []string `json:"local_dns"`
 	Socks5      string   `json:"socks5"`
 	// MihomoBin 是代理内核路径，type=mihomo 的出口靠它落地成 socks5。
-	MihomoBin    string `json:"mihomo_bin"`
-	Exits        []Exit `json:"exits"`
-	DefaultExit  string `json:"default_exit"`
-	Routing      bool   `json:"routing_enabled"`
-	RulesFile    string `json:"rules_file"`
-	CacheSize    int    `json:"cache_size"`
-	SyntheticTTL uint32 `json:"synthetic_ttl"`
+	MihomoBin   string `json:"mihomo_bin"`
+	Exits       []Exit `json:"exits"`
+	DefaultExit string `json:"default_exit"`
+	Routing     bool   `json:"routing_enabled"`
+	RulesFile   string `json:"rules_file"`
+	// NoProxy 是「必须直连」的补充域名，格式与规则文件一致：
+	// 裸域名 / DOMAIN,xxx / DOMAIN-SUFFIX,xxx / DOMAIN-KEYWORD,xxx。
+	// 内置的推送、邮件、STUN 白名单见 noproxy.go，这里只用来加自己的。
+	NoProxy      []string `json:"no_proxy"`
+	CacheSize    int      `json:"cache_size"`
+	SyntheticTTL uint32   `json:"synthetic_ttl"`
 	// CacheMinTTL 是直连记录在网关侧的最短缓存秒数。上游 TTL 常只有 60s，
 	// 会和手机缓存同时失效，导致每次都要跨境回源；延长这一侧缓存后，
 	// 手机再查时直接命中，只有手机到网关这一次往返。
 	// 对外作答的 TTL 仍不超过上游原值，客户端的缓存行为不变。
-	CacheMinTTL uint32    `json:"cache_min_ttl"`
+	CacheMinTTL uint32 `json:"cache_min_ttl"`
 	// LazyTTL 是缓存过期后的宽限期秒数（stale-while-revalidate）。
 	// 期间仍用旧答案立即应答、后台再刷新，避免用户等待跨境回源。
 	// 对齐 5GPN-X 的 lazy_cache_ttl；设 0 关闭该行为。
-	LazyTTL uint32    `json:"lazy_ttl"`
-	Log     LogConfig `json:"log"`
-	Rules       RulesConf `json:"rules"`
-	Telegram    TGConf    `json:"telegram"`
-	QUIC        QUICConf  `json:"quic"`
+	LazyTTL  uint32    `json:"lazy_ttl"`
+	Log      LogConfig `json:"log"`
+	Rules    RulesConf `json:"rules"`
+	Telegram TGConf    `json:"telegram"`
+	QUIC     QUICConf  `json:"quic"`
 }
 
 type Listen struct {
@@ -136,13 +140,17 @@ func defaultConfig() *Config {
 	c.ECS = "139.226.48.1"
 	c.MihomoBin = "/usr/local/bin/mihomo"
 	c.UpstreamDNS = []string{"223.5.5.5:53", "119.29.29.29:53"}
-	c.LocalDNS = []string{"101.226.4.6", "218.30.118.6", "180.76.76.76", "119.29.29.29"}
+	// 从境外实测可用的一组：101.226.4.6 从东京走 UDP 完全不通、只能靠 TCP
+	// 兜底（每次冷查询白等近 6 秒），换成这三家。
+	c.LocalDNS = []string{"223.5.5.5:53", "119.29.29.29:53", "223.6.6.6:53"}
 	c.RemoteDNS = []string{"1.1.1.1", "8.8.8.8", "9.9.9.9"}
 	c.Exits = []Exit{{Name: ExitDirect, Type: "direct"}}
 	c.DefaultExit = ExitDirect
 	c.Routing = true
 	c.RulesFile = "/etc/dotmux/rules.conf"
-	c.CacheSize = 8192
+	// 137408 条规则下热门域名远超 8192，缓存太小会频繁淘汰。
+	// 每条约 1KB，32768 条约 30MB，对 512MB 起的机器可以接受。
+	c.CacheSize = 32768
 	c.SyntheticTTL = 60
 	c.CacheMinTTL = 600
 	c.LazyTTL = 300

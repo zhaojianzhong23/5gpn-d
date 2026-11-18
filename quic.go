@@ -36,6 +36,36 @@ type quicRelay struct {
 	sess   sync.Map // "addr#连接ID" -> *quicSession（一条会话登记多个 ID）
 	lens   sync.Map // 连接 ID 长度 -> struct{}，短头包按长度逐个试
 	closed atomic.Bool
+
+	// live 是当前会话数。每条会话占一个出站 UDP socket，也就是一个 fd；
+	// 没有上限的话，一个跑疯了的客户端（或异常重连风暴）就能把 fd 吃干净，
+	// 连 TCP 转发和 DoT 都分不到 socket。上限和 TCP 那道闸门是一个道理。
+	live atomic.Int64
+
+	// addrMu 保护域名解析结果缓存。QUIC 会话是短命的，每次新建都要解析一次
+	// 域名，全部回源到境外 DNS 既慢又浪费——同一个站点几秒钟内可能建十几条。
+	addrMu sync.Mutex
+	addrs  map[string]quicAddr
+}
+
+// maxQUICSessions 是同时在册的 QUIC 会话上限。
+const maxQUICSessions = 2048
+
+// maxQUICDatagram 是单条 QUIC 报文的读缓冲。链路 MTU 一般 1500，给到 4096
+// 留足余量；取 65535 的话每条会话常驻 64KB，两千条就是 128MB。
+const maxQUICDatagram = 4096
+
+type quicAddr struct {
+	ip  net.IP
+	exp time.Time
+}
+
+// quicBufPool 复用读缓冲，避免每个 UDP 报文都分配一次。
+var quicBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, maxQUICDatagram)
+		return &b
+	},
 }
 
 // quicSession 一条 QUIC 连接的上行。
@@ -106,6 +136,7 @@ func (s *quicSession) addKey(cid []byte) {
 
 func (s *quicSession) close() {
 	s.once.Do(func() {
+		s.r.live.Add(-1)
 		_ = s.up.Close()
 		s.mu.Lock()
 		for k := range s.keys {
@@ -138,6 +169,7 @@ func startQUIC(cfg *Config, rules func() *RuleSet, dyn *Dyn) error {
 		nets:  cfg.ClientNets(),
 		idle:  time.Duration(cfg.QUIC.IdleSec) * time.Second,
 		port:  443,
+		addrs: make(map[string]quicAddr),
 	}
 	go r.run()
 	go r.gc()
@@ -146,7 +178,11 @@ func startQUIC(cfg *Config, rules func() *RuleSet, dyn *Dyn) error {
 }
 
 func (r *quicRelay) run() {
-	buf := make([]byte, 65535)
+	bp := quicBufPool.Get().(*[]byte)
+	buf := *bp
+	defer quicBufPool.Put(bp)
+	pkt := make([]byte, maxQUICDatagram)
+
 	for {
 		n, addr, err := r.conn.ReadFromUDP(buf)
 		if err != nil {
@@ -158,7 +194,12 @@ func (r *quicRelay) run() {
 		if n < 5 {
 			continue
 		}
-		pkt := make([]byte, n)
+		// 这一层是单 goroutine 串行处理，复用一个缓冲就够：下面的 Write
+		// 都是同步的，没有任何人会在返回后继续持有这段字节。
+		//
+		// 顺序不能反：pkt 的长度在上一轮被截成过更短的值，先 copy 会把
+		// 这轮的报文悄悄截短，所以必须先按 n 扩回长度。
+		pkt = pkt[:n]
 		copy(pkt, buf[:n])
 
 		if v, ok := r.lookup(addr, pkt); ok {
@@ -283,6 +324,10 @@ func (r *quicRelay) handleNew(addr *net.UDPAddr, pkt []byte) {
 	if !inNets(addr.IP, r.nets) {
 		return // 非托管来源不接管
 	}
+	if r.live.Load() >= maxQUICSessions {
+		logf("warn", "QUIC 会话数已达上限 %d，丢弃 %s 的新会话（%s）", maxQUICSessions, addr, host)
+		return
+	}
 	act, target := ActionProxy, ""
 	if r.dyn.RoutingEnabled() {
 		act, target = r.rules().MatchRoute(host)
@@ -310,12 +355,37 @@ func (r *quicRelay) handleNew(addr *net.UDPAddr, pkt []byte) {
 	}
 
 	s := &quicSession{r: r, client: addr, up: up, target: host, keys: map[string]struct{}{}}
+	r.live.Add(1)
 	s.touch()
 	s.addKey(ini.dcid)
 	go r.pumpBack(s)
 	if err := s.up.Write(pkt); err != nil {
 		s.close()
 	}
+}
+
+// resolveCached 带短缓存的域名解析。QUIC 的每条会话都要知道目标地址，
+// 而一个页面几秒内可能连开十几条，全回源到境外 DNS 太亏。
+func (r *quicRelay) resolveCached(host string) (net.IP, error) {
+	r.addrMu.Lock()
+	if e, ok := r.addrs[host]; ok && time.Now().Before(e.exp) {
+		r.addrMu.Unlock()
+		return e.ip, nil
+	}
+	r.addrMu.Unlock()
+
+	ip, err := resolveA(r.dyn.RemoteDNS(), host)
+	if err != nil {
+		return nil, err
+	}
+	r.addrMu.Lock()
+	if len(r.addrs) >= 4096 {
+		// 简单防膨胀：满了就换张新表。这里存的是纯数据，清掉只是下次多解析一次。
+		r.addrs = make(map[string]quicAddr)
+	}
+	r.addrs[host] = quicAddr{ip: ip, exp: time.Now().Add(time.Minute)}
+	r.addrMu.Unlock()
+	return ip, nil
 }
 
 // newPeer 按出口类型选择上行方式：socks5/mihomo 走 UDP 关联，其余本机直连。
@@ -331,7 +401,7 @@ func (r *quicRelay) newPeer(exit Exit, host string, port int) (udpPeer, error) {
 		logf("debug", "quic %s -> %s 经出口 %s", host, exit.Addr, exit.Name)
 		return &proxiedUDP{s: su, host: host, port: port}, nil
 	}
-	ip, err := resolveA(r.dyn.RemoteDNS(), host)
+	ip, err := r.resolveCached(host)
 	if err != nil {
 		return nil, err
 	}
@@ -344,7 +414,9 @@ func (r *quicRelay) newPeer(exit Exit, host string, port int) (udpPeer, error) {
 }
 
 func (r *quicRelay) pumpBack(s *quicSession) {
-	buf := make([]byte, 65535)
+	bp := quicBufPool.Get().(*[]byte)
+	buf := *bp
+	defer quicBufPool.Put(bp)
 	for {
 		n, err := s.up.Read(buf)
 		if err != nil {

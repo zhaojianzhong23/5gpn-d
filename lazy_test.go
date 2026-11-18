@@ -64,12 +64,14 @@ func TestStaleDroppedAfterGrace(t *testing.T) {
 func TestDNSRacePicksFastest(t *testing.T) {
 	fast, _ := net.ListenPacket("udp", "127.0.0.1:15461")
 	slow, _ := net.ListenPacket("udp", "127.0.0.1:15462")
-	defer fast.Close(); defer slow.Close()
+	defer fast.Close()
+	defer slow.Close()
 
 	mk := func(delay time.Duration, ip string, pc net.PacketConn) {
 		srv := &dns.Server{PacketConn: pc, Handler: dns.HandlerFunc(func(w dns.ResponseWriter, r *dns.Msg) {
 			time.Sleep(delay)
-			m := new(dns.Msg); m.SetReply(r)
+			m := new(dns.Msg)
+			m.SetReply(r)
 			m.Answer = []dns.RR{&dns.A{
 				Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60},
 				A:   net.ParseIP(ip).To4(),

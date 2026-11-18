@@ -19,10 +19,9 @@
     "9.9.9.9"
   ],
   "local_dns": [
-    "101.226.4.6",
-    "218.30.118.6",
-    "180.76.76.76",
-    "119.29.29.29"
+    "223.5.5.5",
+    "119.29.29.29",
+    "223.6.6.6"
   ],
   "mihomo_bin": "/usr/local/bin/mihomo",
   "exits": [
@@ -45,7 +44,8 @@
   "default_exit": "local",
   "routing_enabled": true,
   "rules_file": "/etc/dotmux/rules.conf",
-  "cache_size": 8192,
+  "no_proxy": [],
+  "cache_size": 32768,
   "synthetic_ttl": 60,
   "cache_min_ttl": 600,
   "lazy_ttl": 300,
@@ -62,6 +62,20 @@
         "format": "domain",
         "prefix": "DOMAIN-SUFFIX",
         "action": "proxy"
+      },
+      {
+        "name": "proxy",
+        "url": "https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/proxy.txt",
+        "format": "clash",
+        "prefix": "DOMAIN-SUFFIX",
+        "action": "proxy"
+      },
+      {
+        "name": "cn",
+        "url": "https://raw.githubusercontent.com/Loyalsoldier/clash-rules/release/direct.txt",
+        "format": "clash",
+        "prefix": "DOMAIN-SUFFIX",
+        "action": "direct"
       }
     ]
   },

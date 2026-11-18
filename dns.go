@@ -4,6 +4,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"net"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -78,6 +79,50 @@ func (c *dnsCache) getWithStale(key string) (*dns.Msg, bool) {
 	return m, stale
 }
 
+// evictSample 是淘汰时随机抽取的候选条数。取样而不是全表排序，是为了让
+// 这一下开销跟缓存大小无关——命中路径上不做任何额外工作。
+const evictSample = 64
+
+// evictLocked 腾出缓存空间。调用方必须已持有 c.mu。
+//
+// 以前这里是「满了就整体丢弃」：8192 条缓存说没就没，之后每个域名全变成
+// 未命中，所有请求一起跨境回源，表现成「每隔一阵所有网站同时卡一下」。
+// 现在先清过期项（通常这一遍就够了），仍然满就在随机样本里淘汰最早失效的
+// 一半——Redis 淘汰过期键用的也是这个思路，近似 LRU 且不需要额外结构。
+func (c *dnsCache) evictLocked() {
+	now := time.Now()
+	grace := now.Add(-c.lazyTTL)
+	for k, v := range c.m {
+		// 超过宽限期的才是真的没用了（宽限期内的陈旧答案还能秒回一次）。
+		if v.exp.Before(grace) {
+			delete(c.m, k)
+		}
+	}
+	if len(c.m) < c.max {
+		return
+	}
+
+	type victim struct {
+		key string
+		exp time.Time
+	}
+	sample := make([]victim, 0, evictSample)
+	for k, v := range c.m {
+		sample = append(sample, victim{key: k, exp: v.exp})
+		if len(sample) >= evictSample {
+			break
+		}
+	}
+	sort.Slice(sample, func(i, j int) bool { return sample[i].exp.Before(sample[j].exp) })
+	n := len(sample) / 2
+	if n < 1 {
+		n = 1
+	}
+	for i := 0; i < n; i++ {
+		delete(c.m, sample[i].key)
+	}
+}
+
 // put 写入缓存。cacheFor 是网关侧的存活秒数，origTTL 是上游原 TTL，
 // 后者用于对外作答时限制 TTL，两者可以不同。
 func (c *dnsCache) put(key string, msg *dns.Msg, cacheFor, origTTL uint32) {
@@ -87,16 +132,7 @@ func (c *dnsCache) put(key string, msg *dns.Msg, cacheFor, origTTL uint32) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(c.m) >= c.max {
-		// 简单淘汰：清掉一批过期项，仍然满就整体丢弃（不做复杂 LRU）。
-		now := time.Now()
-		for k, v := range c.m {
-			if now.After(v.exp) {
-				delete(c.m, k)
-			}
-		}
-		if len(c.m) >= c.max {
-			c.m = make(map[string]cacheEntry)
-		}
+		c.evictLocked()
 	}
 	c.m[key] = cacheEntry{msg: msg.Copy(), exp: time.Now().Add(time.Duration(cacheFor) * time.Second), ttl: origTTL}
 }
@@ -108,6 +144,7 @@ type dnsSvc struct {
 	nets       []*net.IPNet
 	cache      *dnsCache
 	refreshing sync.Map // key -> struct{}，陈旧刷新的去重，避免缓存击穿
+	flights    sync.Map // key -> *dnsFlight，冷启动未命中的回源合并
 	// 启动时确定，避免每包解析
 	gatewayV4 net.IP
 	ecs       net.IP
@@ -223,7 +260,7 @@ func (s *dnsSvc) forward(w dns.ResponseWriter, req *dns.Msg, ecs net.IP) {
 		return
 	}
 
-	resp, err := s.exchange(req, ecs)
+	resp, err := s.exchangeShared(key, req, ecs)
 	if err != nil {
 		logf("warn", "上游解析失败 q=%s: %v", req.Question[0].Name, err)
 		s.replyEmpty(w, req, dns.RcodeServerFailure)
@@ -232,6 +269,47 @@ func (s *dnsSvc) forward(w dns.ResponseWriter, req *dns.Msg, ecs net.IP) {
 	s.store(key, resp)
 	resp.Id = req.Id
 	_ = w.WriteMsg(resp)
+}
+
+// dnsFlight 是一次正在回源的查询。
+type dnsFlight struct {
+	done chan struct{}
+	resp *dns.Msg
+	err  error
+}
+
+// exchangeShared 合并同一 key 的并发回源。
+//
+// 手机开一个页面会并发发出好几个同名查询（预连接、重试、多个 App 同时唤醒），
+// 缓存还没热的时候这些请求全都没命中，一起去跨境打上游，冷启动那一瞬间
+// 上游会被打出一串抖动。这里只放一个请求真的出去，其余等它的结果。
+//
+// 等待者拿到的是应答的副本：resp.Id 会被各客户端分别改写，共享同一个
+// *dns.Msg 会踩数据竞争。
+func (s *dnsSvc) exchangeShared(key string, req *dns.Msg, ecs net.IP) (*dns.Msg, error) {
+	f := &dnsFlight{done: make(chan struct{})}
+	if v, loaded := s.flights.LoadOrStore(key, f); loaded {
+		other := v.(*dnsFlight)
+		select {
+		case <-other.done:
+			if other.resp == nil {
+				return nil, other.err
+			}
+			return other.resp.Copy(), nil
+		case <-time.After(6 * time.Second):
+			// 领头那个卡住了（上游丢包），别让客户端陪着一起等，
+			// 自己再打一次上游。
+			return s.exchange(req, ecs)
+		}
+	}
+	defer s.flights.Delete(key)
+	f.resp, f.err = s.exchange(req, ecs)
+	close(f.done)
+	if f.resp == nil {
+		return nil, f.err
+	}
+	// 领头者拿走副本，原件留在 flight 里给等待者拷贝。
+	return f.resp.Copy(), nil
 }
 
 // store 把上游应答按缓存策略写入（缓存里的 ID 在下发时会被覆盖）。

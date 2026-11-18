@@ -185,6 +185,11 @@ func main() {
 	}
 	raiseFdLimit()
 
+	// 直连白名单必须在加载规则之前就位：规则判定入口会先查它。
+	initNoProxy(cfg.NoProxy)
+	logf("info", "直连白名单 %d 条（推送/邮件/STUN 内置 + 自定义 %d）",
+		noProxyEntries(), len(cfg.NoProxy))
+
 	dyn := newDyn(cfg, *cfgPath)
 
 	// 代理内核：type=mihomo 的出口靠它落地成本地 socks5。
@@ -212,6 +217,14 @@ func main() {
 		logf("info", "尚无远程规则缓存，先用本地规则启动，后台拉取中")
 	}
 	holder := &ruleHolder{rs: rules, remote: remote}
+
+	// 规则模型体检：FINAL 是 direct 就等于「黑名单模型」——没被点名的流量
+	// 全部直连，漏一条规则那个站就出不去，而且表现为时好时坏的「偶尔打不开」。
+	// 规则少、又没有国内直连表时几乎必然是配错了，启动就喊出来。
+	if rules.Final == ActionDirect && rules.Count() < 1000 {
+		logf("warn", "规则 %d 条且 FINAL 是 direct：漏掉的域名会直连出不去。建议改成 FINAL,proxy 并配一份国内直连表", rules.Count())
+	}
+	logf("info", "规则 %d 条，FINAL=%s", rules.Count(), rules.Final)
 
 	tlsCfg := &tls.Config{
 		MinVersion: tls.VersionTLS12,

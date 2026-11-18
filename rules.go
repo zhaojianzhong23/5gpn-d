@@ -223,6 +223,14 @@ func (rs *RuleSet) Match(domain string) Action {
 // MatchRoute 返回动作和出口名（仅 Action=proxy 时有意义），未命中返回 Final 及其目标。
 func (rs *RuleSet) MatchRoute(domain string) (Action, string) {
 	d := strings.ToLower(strings.TrimSuffix(domain, "."))
+
+	// 不走 80/443 的服务优先判直连：推送、邮件、STUN 这类域名一旦被解析成
+	// 网关地址，客户端会去连一个没人监听的端口，症状是通知收不到、邮件报
+	// 账户错误。它们也常常被 gfw 的大后缀规则顺手扫进去，只能在这里先拦。
+	if noProxyMatch(d) {
+		return ActionDirect, ""
+	}
+
 	if !rs.built {
 		return rs.linearMatchRoute(d)
 	}
