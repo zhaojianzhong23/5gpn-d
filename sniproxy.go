@@ -238,6 +238,15 @@ func (s *snipSvc) handle(c net.Conn, isTLS bool) {
 		}
 	}
 
+	// 自连接防护：如果目标域名解析出来就是本机自己的 IP（典型是网关域名
+	// kfc.example.com 的 A 记录指向本机），直接丢弃。否则会形成
+	// 本机:随机端口 → 本机:80/443 → 再解析 → 再连自己 的死循环，
+	// 几次就把 fd 冲到 65535，表现为「443 凭空消失 + DNS 全部 too many open files」。
+	if s.isSelfTarget(host, s.dyn.RemoteDNS()) {
+		logf("debug", "忽略指向本机的转发目标 %s（防止自连接死循环）", host)
+		return
+	}
+
 	upstream, err := DialVia(exit, host, port, 8*time.Second, s.dyn.RemoteDNS)
 	if err != nil {
 		logf("warn", "连接 %s:%d（出口 %s）失败: %v", host, port, exit.Name, err)
@@ -493,6 +502,41 @@ func pump(br *bufio.Reader, upstream net.Conn, client net.Conn) {
 	}()
 	<-done
 	<-done
+}
+
+// isSelfTarget 判断转发目标会不会解析到网关自己（公网网关 IP）。
+//
+// 只比对配置里的 gateway_ip —— 那是 DNS 层给 proxy 域名合成的 A 记录，
+// 也是死循环的根源（网关域名 A 记录 = gateway_ip，SNI 转发再解析又指回来）。
+// 故意不扫描所有网卡 IP，更不把 127.0.0.1 算进来：e2e 测试用本地 mock
+// 当"海外目标"，把它当本机误杀会让 proxy 转发失效。
+func (s *snipSvc) isSelfTarget(host string, remoteDNS []string) bool {
+	gw := net.ParseIP(s.cfg.GatewayIP).To4()
+	// 回环/私网网关是 e2e 测试与本地调试场景，那里假 DNS 把所有域名都
+	// 指向 127.0.0.1，开启这个判断会把正常转发全误杀。只在公网网关启用。
+	if gw == nil || !gw.IsGlobalUnicast() || gw.IsPrivate() || gw.IsLoopback() {
+		return false
+	}
+	candidates := []net.IP{}
+	if ip := net.ParseIP(host); ip != nil {
+		candidates = append(candidates, ip.To4())
+	} else if gw != nil && strings.EqualFold(strings.TrimSuffix(host, "."), strings.TrimSuffix(s.cfg.Domain, ".")) {
+		// 目标就是网关域名本身：A 记录必然指回网关，无需再查 DNS
+		return true
+	} else if len(remoteDNS) > 0 {
+		if ip, err := resolveA(remoteDNS, host); err == nil {
+			candidates = append(candidates, ip.To4())
+		}
+	}
+	if gw == nil {
+		return false
+	}
+	for _, c := range candidates {
+		if c != nil && c.Equal(gw) {
+			return true
+		}
+	}
+	return false
 }
 
 func remoteIPOf(c net.Conn) net.IP {
