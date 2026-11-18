@@ -122,18 +122,26 @@ ver_gt() {
     [[ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" == "$1" ]]
 }
 
-# 取最新标签：先用 releases/latest 的重定向（不占 API 配额），
-# 失败再退回 API。两个都拿不到就返回空，由调用方决定不升级。
+# 取最新标签：网页重定向和 API 两条路都问，取较高的那个。
+#
+# 只用网页重定向不够：它走 CDN 有缓存。刚打完 tag 立刻跑升级，那边可能
+# 还指着上一个版本，脚本就会「成功地」把二进制换成旧版，版本号还倒退了。
+# API 不缓存、当场就是新的，但匿名调用有 60 次/小时配额，所以两条都留着，
+# 谁新用谁；两个都拿不到就返回空，由调用方决定本次不升级。
 latest_tag() {
-    local t=""
-    t=$(curl -fsSIL --max-time 20 -o /dev/null -w '%{url_effective}' \
+    local web="" api=""
+    web=$(curl -fsSIL --max-time 20 -o /dev/null -w '%{url_effective}' \
         "https://github.com/${REPO}/releases/latest" 2>/dev/null | sed -n 's#.*/tag/##p')
-    if [[ -z "$t" ]]; then
-        t=$(curl -fsS --max-time 20 -H 'Accept: application/vnd.github+json' \
-            "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
-            | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    api=$(curl -fsS --max-time 20 -H 'Accept: application/vnd.github+json' \
+        "https://api.github.com/repos/${REPO}/releases/latest" 2>/dev/null \
+        | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -1)
+    if [[ -z "$web" ]]; then printf '%s' "$api"; return; fi
+    if [[ -z "$api" ]]; then printf '%s' "$web"; return; fi
+    if ver_gt "${web#v}" "${api#v}"; then
+        printf '%s' "$web"
+    else
+        printf '%s' "$api"
     fi
-    printf '%s' "$t"
 }
 
 upgrade_if_needed() {
