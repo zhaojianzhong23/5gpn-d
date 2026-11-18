@@ -488,9 +488,61 @@ if [[ "$DIAG" -eq 1 ]]; then
     exit 0
 fi
 
+# 1.19.34 起才有 snell v6（v6 是 PSK 派生的分片混淆层），旧版遇到
+# version: 6 会直接报 "snell version error"。
+MIHOMO_VERSION="${MIHOMO_VERSION:-1.19.34}"
+
+# 代理内核：出口粘 ss/vmess/vless/trojan/hysteria2/snell 等链接时用它落地。
+# 定义必须在这下面那个「装过就走升级」的分支之前 —— bash 是顺序执行的，
+# 定义在分支后面，升级路径里就调不到它。
+install_mihomo() {
+    if command -v mihomo >/dev/null 2>&1; then
+        # 不能因为「文件存在」就跳过：老版本没有 snell v6，升级完 dotmux
+        # 出口照样连不上，而错误只落在 mihomo.log 里，很难联想到内核版本。
+        local cur=""
+        cur="$(mihomo -v 2>/dev/null | sed -n 's/.*[[:space:]]v\([0-9][0-9.]*\).*/\1/p' | head -1)"
+        if [[ -z "$cur" ]]; then
+            ok "mihomo 已存在（版本未知，跳过）：$(command -v mihomo)"
+            return 0
+        fi
+        if ! ver_gt "$MIHOMO_VERSION" "$cur"; then
+            ok "mihomo v${cur} 满足要求（≥ v${MIHOMO_VERSION}）"
+            return 0
+        fi
+        info "mihomo v${cur} 低于 v${MIHOMO_VERSION}，升级（snell v6 需要新版）"
+    fi
+    local arch
+    case "$(uname -m)" in
+        x86_64|amd64)  arch=amd64 ;;
+        aarch64|arm64) arch=arm64 ;;
+        *) warn "未知架构 $(uname -m)，跳过 mihomo（出口只能用 direct / socks5）"; return 0 ;;
+    esac
+    local name="mihomo-linux-${arch}-v${MIHOMO_VERSION}"
+    local base="https://github.com/MetaCubeX/mihomo/releases/download/v${MIHOMO_VERSION}"
+    local tmp; tmp="$(mktemp -d)"
+    if ! dl "${tmp}/m.gz" "${base}/${name}.gz" 240; then
+        rm -rf "$tmp"
+        warn "mihomo 下载失败（直连与镜像都不通），跳过"
+        printf '%s' "$DL_DIAG" >&2
+        echo "  出口暂时只能用 direct / socks5；网络恢复后重跑本脚本会补装。" >&2
+        return 0
+    fi
+    gunzip -f "${tmp}/m.gz" || { rm -rf "$tmp"; warn "解压 mihomo 失败"; return 0; }
+    install -m 0755 "${tmp}/m" /usr/local/bin/mihomo || { rm -rf "$tmp"; warn "安装 mihomo 失败"; return 0; }
+    rm -rf "$tmp"
+    if /usr/local/bin/mihomo -v >/dev/null 2>&1; then
+        ok "mihomo v${MIHOMO_VERSION} 已安装"
+    else
+        warn "mihomo 安装后无法执行，出口请先用 direct / socks5"
+    fi
+}
+
 # 装过就只做升级检查，不再重复装依赖、签证书
 if [[ -x "$BIN" && -f "$CONF" ]]; then
     upgrade_if_needed "$FORCE" || exit 1
+    # 内核也得看。这一支以前只换 dotmux、从不碰 mihomo，于是「升级成功」
+    # 但粘 snell v6 链接照样报 snell version error，而错误只在 mihomo.log 里。
+    install_mihomo
     ensure_service_running || exit 1
     exit 0
 fi
@@ -594,53 +646,6 @@ else
     DEF_EXIT="local"
 fi
 [[ -n "$GATEWAY_IP" ]] || { err "需要公网 IPv4"; exit 1; }
-
-# 1.19.34 起才有 snell v6（v6 是 PSK 派生的分片混淆层），旧版遇到
-# version: 6 会直接报 "snell version error"。
-MIHOMO_VERSION="${MIHOMO_VERSION:-1.19.34}"
-
-# 代理内核：出口粘 ss/vmess/vless/trojan/hysteria2/snell 等链接时用它落地
-install_mihomo() {
-    if command -v mihomo >/dev/null 2>&1; then
-        # 不能因为「文件存在」就跳过：老版本没有 snell v6，升级完 dotmux
-        # 出口照样连不上，而错误只落在 mihomo.log 里，很难联想到内核版本。
-        local cur=""
-        cur="$(mihomo -v 2>/dev/null | sed -n 's/.*[[:space:]]v\([0-9][0-9.]*\).*/\1/p' | head -1)"
-        if [[ -z "$cur" ]]; then
-            ok "mihomo 已存在（版本未知，跳过）：$(command -v mihomo)"
-            return 0
-        fi
-        if ! ver_gt "$MIHOMO_VERSION" "$cur"; then
-            ok "mihomo v${cur} 已存在，无需升级"
-            return 0
-        fi
-        info "mihomo v${cur} 低于 v${MIHOMO_VERSION}，升级（snell v6 需要新版）"
-    fi
-    local arch
-    case "$(uname -m)" in
-        x86_64|amd64)  arch=amd64 ;;
-        aarch64|arm64) arch=arm64 ;;
-        *) warn "未知架构 $(uname -m)，跳过 mihomo（出口只能用 direct / socks5）"; return 0 ;;
-    esac
-    local name="mihomo-linux-${arch}-v${MIHOMO_VERSION}"
-    local base="https://github.com/MetaCubeX/mihomo/releases/download/v${MIHOMO_VERSION}"
-    local tmp; tmp="$(mktemp -d)"
-    if ! dl "${tmp}/m.gz" "${base}/${name}.gz" 240; then
-        rm -rf "$tmp"
-        warn "mihomo 下载失败（直连与镜像都不通），跳过"
-        printf '%s' "$DL_DIAG" >&2
-        echo "  出口暂时只能用 direct / socks5；网络恢复后重跑本脚本会补装。" >&2
-        return 0
-    fi
-    gunzip -f "${tmp}/m.gz" || { rm -rf "$tmp"; warn "解压 mihomo 失败"; return 0; }
-    install -m 0755 "${tmp}/m" /usr/local/bin/mihomo || { rm -rf "$tmp"; warn "安装 mihomo 失败"; return 0; }
-    rm -rf "$tmp"
-    if /usr/local/bin/mihomo -v >/dev/null 2>&1; then
-        ok "mihomo v${MIHOMO_VERSION} 已安装"
-    else
-        warn "mihomo 安装后无法执行，出口请先用 direct / socks5"
-    fi
-}
 
 STEP="安装依赖"
 info "安装依赖..."
