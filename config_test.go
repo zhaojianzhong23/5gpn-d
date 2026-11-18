@@ -4,6 +4,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 )
 
@@ -174,10 +175,14 @@ func TestExitWorkDir(t *testing.T) {
 		cfg.Telegram.StateFile = c.state
 		cfg.Rules.CacheDir = c.cache
 		got := cfg.ExitWorkDir()
-		if got != c.want {
-			t.Fatalf("state=%q cache=%q -> %q，应为 %q", c.state, c.cache, got, c.want)
+		// 期望值用 / 写，比较时转成本平台分隔符：Windows 上跑测试不该因为
+		// "\var\lib\..." 和 "/var/lib/..." 的差别而红。
+		if want := filepath.FromSlash(c.want); got != want {
+			t.Fatalf("state=%q cache=%q -> %q，应为 %q", c.state, c.cache, got, want)
 		}
-		if !filepath.IsAbs(got) {
+		// Windows 上 "\var\lib\..." 没有盘符，本来就不算绝对路径，
+		// 这条断言只在目标平台（linux）才有意义。
+		if runtime.GOOS != "windows" && !filepath.IsAbs(got) {
 			t.Fatalf("必须是绝对路径，得到 %q", got)
 		}
 	}

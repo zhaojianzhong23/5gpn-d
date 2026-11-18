@@ -213,6 +213,13 @@ func (s *snipSvc) handle(c net.Conn, isTLS bool) {
 	start := time.Now()
 	defer c.Close()
 
+	// 配置为空说明这是个构造不完整的 svc：后面每一步都要读 s.cfg，
+	// 放着不管就是 goroutine 里 nil deref —— 那不是断一条连接，是整个进程退出。
+	if s.cfg == nil {
+		logf("error", "snipSvc 缺少配置，丢弃连接 %s", c.RemoteAddr())
+		return
+	}
+
 	remoteIP := remoteIPOf(c)
 	managed := inNets(remoteIP, s.nets)
 
@@ -621,6 +628,9 @@ var docNets = func() []*net.IPNet {
 // 网关是回环/私网/文档地址时（e2e 测试与本地调试）不启用：那里 127.0.0.1
 // 就是模拟的「海外目标」，按自环拦掉会让正常转发全废。
 func (s *snipSvc) selfGuardOn() bool {
+	if s == nil || s.cfg == nil {
+		return false
+	}
 	gw := net.ParseIP(s.cfg.GatewayIP).To4()
 	if gw == nil || !gw.IsGlobalUnicast() || gw.IsPrivate() || gw.IsLoopback() {
 		return false
@@ -635,6 +645,9 @@ func (s *snipSvc) selfGuardOn() bool {
 // 故意不扫描所有网卡 IP，更不把 127.0.0.1 算进来：e2e 测试用本地 mock
 // 当"海外目标"，把它当本机误杀会让 proxy 转发失效。
 func (s *snipSvc) isSelfTarget(host string, remoteDNS []string) bool {
+	if s == nil || s.cfg == nil {
+		return false
+	}
 	gw := net.ParseIP(s.cfg.GatewayIP).To4()
 	// 回环/私网网关是 e2e 测试与本地调试场景，那里假 DNS 把所有域名都
 	// 指向 127.0.0.1，开启这个判断会把正常转发全误杀。只在公网网关启用。

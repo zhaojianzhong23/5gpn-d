@@ -27,7 +27,7 @@ func (l *flakyListener) Addr() net.Addr { return &net.TCPAddr{IP: net.IPv4(127, 
 
 // fd 用尽只是暂时的：acceptLoop 必须退避后继续，而不是把整个 443 关掉。
 func TestAcceptLoopSurvivesEMFILE(t *testing.T) {
-	s := &snipSvc{}
+	s := &snipSvc{cfg: &Config{}}
 	ln := &flakyListener{fails: 3}
 	start := time.Now()
 	err := s.acceptLoop(ln, true)
@@ -51,7 +51,7 @@ func TestSuperviseRebindsAfterClose(t *testing.T) {
 		t.Fatal(err)
 	}
 	addr := ln.Addr().String()
-	s := &snipSvc{}
+	s := &snipSvc{cfg: &Config{}}
 	go s.supervise(addr, true, ln)
 
 	waitAlive(t, s, true)

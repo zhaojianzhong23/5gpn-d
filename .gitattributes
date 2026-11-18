@@ -1,0 +1,7 @@
+# 仓库内容一律 LF。
+# 在 Windows 上编辑后提交 CRLF 会让 CI 的 `gofmt -l` 直接判失败，
+# 更要命的是 install.sh/uninstall.sh 带 CRLF 到 linux 上会报
+# "bad interpreter: /bin/bash^M"，升级脚本当场跑不起来。
+* text=auto eol=lf
+*.sh text eol=lf
+*.go text eol=lf
