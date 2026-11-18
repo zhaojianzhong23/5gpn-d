@@ -1,6 +1,9 @@
 /dotmux
 /5gpn-d
 /dotmux-linux-*
+# go build 在 Windows 上默认落一个 <模块名>.exe 在根目录，别让它混进仓库
+/5gpn-d.exe
+*.exe
 *.pem
 *.key
 *.mobileconfig
