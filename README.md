@@ -22,7 +22,7 @@ iPhone/Android ── DoT :853 ──► dotmux ──► 国内域名：返回�
 | 记录抑制 | 对托管客户端拒绝 `AAAA`、`HTTPS`、`SVCB`，防止拿到真实地址绕过网关 |
 | TCP 443/80 | 从 ClientHello 读 SNI（HTTP 读 Host），按域名选出口转发 |
 | QUIC UDP/443 | 解密 QUIC v1 Initial 包取 SNI，按规则走 SOCKS5 UDP 关联或直连；会话按连接 ID 维护，空闲回收（默认关，见下） |
-| 多出口 | `exits[]` 可放任意多个出口：`direct`、`socks5`，或直接粘 **ss / vmess / vless / trojan / hysteria2 / tuic / anytls** 分享链接（由内置 mihomo 落地）；规则用 `proxy:名字` 精确指定，默认出口 Bot 里一键切换 |
+| 多出口 | `exits[]` 可放任意多个出口：`direct`、`socks5`，或直接粘 **ss / vmess / vless / trojan / hysteria2 / tuic / anytls / naive** 分享链接（由内置 mihomo 落地）；规则用 `proxy:名字` 精确指定，默认出口 Bot 里一键切换 |
 | 规则 | 本地文件 + 定时拉取远程规则源（clash / domain / gfwlist / dnsmasq），格式猜错自动换着试，失败回退上次缓存 |
 | 控制 | Telegram 面板：状态、出口增删改查与探测、规则与规则集增删、分类映射、DNS/域名/证书、日志、重启 |
 | 直连白名单 | 推送（APNs 5223 / FCM 5228）、邮件（IMAP/SMTP/POP）、STUN 这类不走 80/443 的域名强制直连，否则会被解析成网关地址、连到没人监听的端口（通知不来、邮件报账户错误） |
@@ -34,7 +34,7 @@ iPhone/Android ── DoT :853 ──► dotmux ──► 国内域名：返回�
 1. 有公网 IPv4 的 VPS（Debian 12+ / Ubuntu 22.04+），root；
 2. 一个域名，A 记录指向该 VPS（DoT 证书，需 TCP/80 可签 Let's Encrypt，Cloudflare 用灰云）；
 3. 一个固定来源网段 `client_cidr` —— **网关靠来源网段判断"这条查询是我的设备发的"**。手机流量若没有固定私网源段，这套方案不成立；装的时候会问，手机卡只给单个 IP（如 `172.22.1.10`）也可以直接填，程序按 `/32` 处理；
-4. 可选：一个或多个落地出口。可以是 SOCKS5，也可以直接粘机场的分享链接（ss / vmess / vless / trojan / hysteria2 / tuic / anytls），dotmux 会为每个出口拉起一个 mihomo 实例，本地监听 socks5 后接进来；
+4. 可选：一个或多个落地出口。可以是 SOCKS5，也可以直接粘机场的分享链接（ss / vmess / vless / trojan / hysteria2 / tuic / anytls / naive），dotmux 会为每个出口拉起一个 mihomo 实例，本地监听 socks5 后接进来；
 5. 想用分享链接的话需要一个 `mihomo` 二进制，安装脚本会自动装，也可以 `MIHOMO_BIN` 指到已有路径。
 
 放行：TCP `853`、`80`、`443`，UDP `443`。
@@ -152,7 +152,9 @@ Bot 里「出口管理 → 添加出口」，发一条即可（名字可省）�
 ```
 
 支持 `ss`（含 2022 与插件）、`vmess`、`vless`（含 reality / ws / grpc / h2）、`trojan`、`hysteria2`、
-`tuic`、`anytls`、`socks5`、`http`。
+`tuic`、`anytls`、`naive`、`socks5`、`http`。
+
+**关于 naive：** mihomo 没有 naive 的出站实现（`adapter/outbound/` 下没有 `naive.go`），所以这里用 `naive+https://user:pass@host:443` 落到 **HTTP CONNECT over TLS**——naive 服务端（caddy forwardproxy）本身就是标准 CONNECT 代理，认证对上了就收 HTTP/1.1 的 CONNECT。能用，但丢掉了 naive 的 HTTP/2 多路复用和 padding 混淆，流量特征退化成普通 HTTPS 代理；服务端若只放行 h2 会连不上。可选参数：`sni=`（默认用主机名）、`fp=chrome`（透传给 mihomo 的 `fingerprint`，补一点 TLS 指纹伪装）、`allowInsecure=1`。`naive+quic://` 不支持，会直接报错而不是静默降级。naive 是纯 TCP 隧道，这个出口不转发 UDP。
 
 每个这样的出口会拉起一个独立 mihomo 实例，监听 `127.0.0.1:20000` 起的端口，dotmux 把它当普通 socks5 用：
 

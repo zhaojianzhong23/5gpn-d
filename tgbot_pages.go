@@ -537,7 +537,8 @@ func (b *tgBot) onCallback(chatID, msgID int64, data string) {
 			"➕ 添加出口\n\n"+
 				"发一条消息，直接粘链接即可：\n"+
 				"<名字> ss://… / vmess://… / vless://…\n"+
-				"      trojan://… / hysteria2://… / tuic://…\n"+
+				"      trojan://… / hysteria2://… / tuic://… / anytls://…\n"+
+				"      naive+https://user:pass@host:443（按 HTTPS 代理落地）\n"+
 				"<名字> socks5://user:pass@host:port\n"+
 				"<名字> direct\n\n"+
 				"例：香港 vmess://eyJhZGQiOi…\n"+
@@ -1016,7 +1017,7 @@ func (b *tgBot) onInput(chatID int64, s *tgsess, text string) {
 }
 
 // parseExitInput 解析 "<名字> <链接>"。链接可以是 socks5 地址、direct，
-// 也可以是任意分享链接（ss/vmess/vless/trojan/hysteria2/tuic/anytls），
+// 也可以是任意分享链接（ss/vmess/vless/trojan/hysteria2/tuic/anytls/naive），
 // 后者交给内置 mihomo 落地。
 func parseExitInput(s string, seq int) (Exit, error) {
 	s = strings.TrimSpace(s)
@@ -1044,7 +1045,7 @@ func parseExitInput(s string, seq int) (Exit, error) {
 	}
 
 	low := strings.ToLower(rest)
-	// ss / vmess / vless / trojan / hysteria2 / tuic / anytls：交给内核
+	// ss / vmess / vless / trojan / hysteria2 / tuic / anytls / naive：交给内核
 	if isProxyLink(low) {
 		if _, err := ParseProxyURI(rest); err != nil {
 			return Exit{}, err
@@ -1072,7 +1073,9 @@ func parseExitInput(s string, seq int) (Exit, error) {
 // isProxyLink 判断是否是交给 mihomo 的分享链接（不含 socks5，那个自己拨更快）。
 func isProxyLink(low string) bool {
 	for _, p := range []string{"ss://", "vmess://", "vless://", "trojan://",
-		"hysteria2://", "hy2://", "tuic://", "anytls://", "http://", "https://"} {
+		"hysteria2://", "hy2://", "tuic://", "anytls://",
+		"naive://", "naive+https://", "naive+http://", "naive+quic://",
+		"http://", "https://"} {
 		if strings.HasPrefix(low, p) {
 			return true
 		}

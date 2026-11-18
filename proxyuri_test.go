@@ -121,6 +121,54 @@ func TestParseTUICAndAnyTLS(t *testing.T) {
 	}
 }
 
+func TestParseNaive(t *testing.T) {
+	// naive 落到 http + TLS：服务端就是标准 CONNECT 代理。
+	n := mustParse(t, "naive+https://u:p@naive.example.com:8443?sni=sni.example.com#n")
+	if n.Kind() != "http" {
+		t.Fatalf("naive 应落到 http 类型，实际 %v", n.Kind())
+	}
+	if n["server"] != "naive.example.com" || n["port"] != 8443 {
+		t.Fatalf("地址不对: %v", n)
+	}
+	if n["username"] != "u" || n["password"] != "p" {
+		t.Fatalf("凭据不对: %v", n)
+	}
+	if n["tls"] != true || n["sni"] != "sni.example.com" {
+		t.Fatalf("TLS 字段不对: %v", n)
+	}
+	// http outbound 认 sni，不认 servername；写错了 mihomo 会静默用服务器地址。
+	if _, bad := n["servername"]; bad {
+		t.Fatalf("不该写 servername: %v", n)
+	}
+	// 纯 TCP 隧道，必须显式声明不支持 UDP。
+	if n["udp"] != false {
+		t.Fatalf("naive 不该开 udp: %v", n["udp"])
+	}
+
+	// 简写 naive:// 默认 443，不给 sni 时用主机名。
+	m := mustParse(t, "naive://a:b@h.example.com")
+	if m["port"] != 443 || m["sni"] != "h.example.com" {
+		t.Fatalf("默认值不对: %v", m)
+	}
+
+	// 指纹参数要透传，naive 的伪装效果一半靠这个。
+	f := mustParse(t, "naive+https://x:y@fp.example.com:443?fp=chrome")
+	if f["fingerprint"] != "chrome" {
+		t.Fatalf("fingerprint 未透传: %v", f)
+	}
+
+	// allowInsecure 要映射成 mihomo 的 skip-cert-verify。
+	s := mustParse(t, "naive+https://x:y@self.example.com:443?allowInsecure=1")
+	if s["skip-cert-verify"] != true {
+		t.Fatalf("allowInsecure 未生效: %v", s)
+	}
+
+	// QUIC 传输没有对应实现，要明确报错而不是静默降级。
+	if _, err := ParseProxyURI("naive+quic://u:p@h.example.com:443"); err == nil {
+		t.Fatal("naive+quic 应当报错")
+	}
+}
+
 func TestParseSocksAndHTTP(t *testing.T) {
 	n := mustParse(t, "socks5://user:pass@6.6.6.6:1080")
 	if n.Kind() != "socks5" || n["username"] != "user" || n["password"] != "pass" {

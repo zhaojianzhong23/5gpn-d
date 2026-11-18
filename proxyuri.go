@@ -47,6 +47,10 @@ func ParseProxyURI(raw string) (ProxyNode, error) {
 		{"hy2://", parseHysteria2},
 		{"tuic://", parseTUIC},
 		{"anytls://", parseAnyTLS},
+		{"naive+https://", parseNaive},
+		{"naive+http://", parseNaive},
+		{"naive+quic://", parseNaive},
+		{"naive://", parseNaive},
 		{"socks5h://", parseSocksURI},
 		{"socks5://", parseSocksURI},
 		{"socks://", parseSocksURI},
@@ -60,11 +64,15 @@ func ParseProxyURI(raw string) (ProxyNode, error) {
 				return nil, err
 			}
 			n["name"] = "out"
-			n["udp"] = true
+			// 协议自己声明过 udp 就尊重它：naive 这类纯 TCP 隧道必须显式关掉，
+			// 否则 mihomo 会尝试 UDP，挂住之后才超时失败。
+			if _, ok := n["udp"]; !ok {
+				n["udp"] = true
+			}
 			return n, nil
 		}
 	}
-	return nil, fmt.Errorf("不支持的链接类型（支持 ss/vmess/vless/trojan/hysteria2/tuic/anytls/socks5/http）")
+	return nil, fmt.Errorf("不支持的链接类型（支持 ss/vmess/vless/trojan/hysteria2/tuic/anytls/naive/socks5/http）")
 }
 
 // b64Any 尝试几种常见 base64 变体，兼容没补 padding 的分享链接。
@@ -601,6 +609,64 @@ func parseHTTPURI(uri string) (ProxyNode, error) {
 	return n, nil
 }
 
+// parseNaive 解析 naive 分享链接（naive+https://user:pass@host:port）。
+//
+// mihomo 没有 naive 的出站实现（adapter/outbound 下没有 naive.go），
+// 所以这里落到 type: http + TLS。能这么干是因为 naive 服务端（caddy
+// forwardproxy）本身就是一个标准 CONNECT 代理，认证对上了就收 HTTP/1.1
+// 的 CONNECT，不强制客户端用 h2。
+//
+// 代价要讲清楚：丢掉了 naive 的 HTTP/2 多路复用和 padding 混淆，
+// 流量特征退化成「普通 HTTPS 代理」，抗主动探测不如原版 naive 客户端。
+// 服务端如果只放行 h2（少见，但有的反代这么配），这条出口会连不上。
+// 真要 h2，只能另起 naive 客户端做边车，再让这里指向它的本地端口。
+func parseNaive(uri string) (ProxyNode, error) {
+	u, err := url.Parse(uri)
+	if err != nil {
+		return nil, fmt.Errorf("naive 链接不合法: %v", err)
+	}
+	if strings.HasSuffix(strings.ToLower(u.Scheme), "+quic") {
+		return nil, fmt.Errorf("naive+quic 暂不支持：mihomo 没有 naive 实现，这里只能走 HTTPS CONNECT")
+	}
+	host, err := needHost(u.Hostname())
+	if err != nil {
+		return nil, err
+	}
+	port := 443
+	if u.Port() != "" {
+		p, cerr := strconv.Atoi(u.Port())
+		if cerr != nil || p <= 0 || p > 65535 {
+			return nil, fmt.Errorf("naive 端口不合法: %s", u.Port())
+		}
+		port = p
+	}
+	n := ProxyNode{"type": "http", "server": host, "port": port}
+	if user := u.User.Username(); user != "" {
+		n["username"] = user
+		if pass, ok := u.User.Password(); ok {
+			n["password"] = pass
+		}
+	}
+	q := u.Query()
+	sni := qget(q, "sni", "peer", "servername")
+	insecure := truthy(qget(q, "allowInsecure", "allow_insecure", "insecure", "skip-cert-verify"))
+	// 注意字段名：mihomo 的 http outbound 用的是 sni，不是别的协议那套 servername
+	// （见 adapter/outbound/http.go 的 HttpOption）。写错不会报错，只会悄悄用
+	// 服务器地址当 SNI，证书对不上就握手失败，排查起来很费劲。
+	n["tls"] = true
+	n["sni"] = defaultStr(sni, host)
+	if insecure {
+		n["skip-cert-verify"] = true
+	}
+	// naive 的卖点之一是 Chrome 的 TLS 指纹，mihomo 支持就顺手带上。
+	if fp := qget(q, "fingerprint", "fp"); fp != "" {
+		n["fingerprint"] = fp
+	}
+	// naive 是纯 TCP 隧道，没有 UDP 转发能力。
+	n["udp"] = false
+	return n, nil
+}
+
 // linkKind 只按前缀判断类型，用于日志和面板展示（不解析完整节点）。
 func linkKind(link string) string {
 	l := strings.ToLower(strings.TrimSpace(link))
@@ -619,6 +685,8 @@ func linkKind(link string) string {
 		return "tuic"
 	case strings.HasPrefix(l, "anytls://"):
 		return "anytls"
+	case strings.HasPrefix(l, "naive"):
+		return "naive"
 	case strings.HasPrefix(l, "socks"):
 		return "socks5"
 	case strings.HasPrefix(l, "http"):
