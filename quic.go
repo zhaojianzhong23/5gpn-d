@@ -5,13 +5,14 @@ import (
 	"crypto/cipher"
 	"crypto/hmac"
 	"crypto/sha256"
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/zhaojianzhong23/5gpn-d/internal/quicsni"
 )
 
 // QUIC v1 的服务端初始密钥材料（RFC 9001 §5.2）。
@@ -53,11 +54,35 @@ type quicRelay struct {
 	cmu       sync.Mutex
 	perClient map[string]map[*quicSession]struct{}
 
+	// pending 是「尚未收齐 SNI 的新连接」暂存区。Chrome/Cronet 开启后量子密钥
+	// 交换后，ClientHello 会拆到多个 Initial 包；先到的分片解不出 SNI，必须按
+	// 连接 ID 暂存 decoder 和原始包，等拼齐再建会话、按序冲刷，否则第一个包就
+	// 被丢弃，握手永远完不成（Play 下载卡住的典型成因）。key 同 sess：addr#cid。
+	pending sync.Map // "addr#连接ID" -> *quicPending
+
 	// addrMu 保护域名解析结果缓存。QUIC 会话是短命的，每次新建都要解析一次
 	// 域名，全部回源到境外 DNS 既慢又浪费——同一个站点几秒钟内可能建十几条。
 	addrMu sync.Mutex
 	addrs  map[string]quicAddr
 }
+
+// quicPending 是一条还在收集 ClientHello 分片的新连接。
+//
+// 收包主循环是单 goroutine 串行的，dec/buf 只在 handleNew 里被这一条循环
+// 访问，不需要加锁；gc 只读取 last 做过期清理，用原子值避免数据竞争。
+type quicPending struct {
+	dec  *quicsni.Decoder
+	buf  [][]byte // 原始 Initial 包，按到达顺序，解出 SNI 后按序冲刷到上游
+	last atomic.Int64
+}
+
+func newQuicPending() *quicPending {
+	p := &quicPending{dec: quicsni.NewDecoder()}
+	p.last.Store(time.Now().Unix())
+	return p
+}
+
+func (p *quicPending) touch() { p.last.Store(time.Now().Unix()) }
 
 // maxQUICSessions 是同时在册的 QUIC 会话上限。
 const maxQUICSessions = 2048
@@ -262,6 +287,10 @@ func (r *quicRelay) Close() error {
 		v.(*quicSession).close()
 		return true
 	})
+	r.pending.Range(func(k, _ any) bool {
+		r.pending.Delete(k)
+		return true
+	})
 	return r.conn.Close()
 }
 
@@ -343,10 +372,12 @@ func (r *quicRelay) lookup(addr *net.UDPAddr, pkt []byte) (*quicSession, bool) {
 	return nil, false
 }
 
-// isInitialPkt 快速判断是不是 QUIC v1 Initial（长头 + 类型 0）。Initial 一定代表
-// 一条新连接，不能拿“该客户端唯一会话”去兜底，否则第二条连接会被塞给第一条目标。
+// isInitialPkt 判断是不是 QUIC 新连接的 Initial 包（v1 / v2 / draft29）。
+// Initial 一定代表一条新连接，不能拿「该客户端唯一会话」去兜底，否则第二条
+// 连接会被塞给第一条目标。版本判定交给 quicsni，避免只认 v1 时把 v2/draft29
+// 的新连接误当作旧会话的后续包。
 func isInitialPkt(pkt []byte) bool {
-	return len(pkt) > 6 && pkt[0]&0x80 != 0 && pkt[0]&0x30 == 0 && binary.BigEndian.Uint32(pkt[1:5]) == 1
+	return quicsni.IsInitial(pkt)
 }
 
 // sole 返回该客户端唯一的一条会话；有多条时不猜，返回 nil。
@@ -395,14 +426,25 @@ func scidOf(pkt []byte) []byte {
 }
 
 func (r *quicRelay) handleNew(addr *net.UDPAddr, pkt []byte) {
-	ini, err := parseInitial(pkt)
+	// 未知版本：回一个版本协商包，让客户端立刻换到支持的版本或回落 TCP，
+	// 而不是静默丢包、等几十秒超时（w0ven quicsni 的做法）。仅在 >=1200
+	// 字节的首包上回，避免被当成放大攻击的反射源。
+	if vn := quicsni.VersionNegotiation(pkt); vn != nil {
+		_, _ = r.conn.WriteToUDP(vn, addr)
+		return
+	}
+
+	host, dcid, complete, err := r.accumulate(addr, pkt)
 	if err != nil {
-		if err != errNotInitial {
+		if err != errNotInitial && err != quicsni.ErrUnsupportedVersion {
 			logf("debug", "QUIC 解析失败 %s: %v", addr, err)
 		}
 		return
 	}
-	host := ini.host
+	if !complete {
+		return // ClientHello 分片未收齐，已暂存，等后续包
+	}
+
 	if !inNets(addr.IP, r.nets) {
 		return // 非托管来源不接管
 	}
@@ -455,11 +497,73 @@ func (r *quicRelay) handleNew(addr *net.UDPAddr, pkt []byte) {
 	// 先登记再起泵：之后任何路径上的 close 都能保证 detach 一定找得到索引项。
 	r.attach(s)
 	s.touch()
-	s.addKey(ini.dcid)
+	s.addKey(dcid)
 	go r.pumpBack(s)
-	if err := s.up.Write(pkt); err != nil {
-		s.close()
+	// 冲刷拼接期间缓冲的全部 Initial 包（按到达顺序），否则握手卡在第一个分片。
+	for _, b := range r.takePending(addr, dcid) {
+		if err := s.up.Write(b); err != nil {
+			s.close()
+			break
+		}
 	}
+	// 会话已锁定目标，线索不再需要，清掉避免陈旧命中。
+	dnsHints.drop(addr.IP)
+}
+
+// accumulate 把一条新连接的 Initial 分片拼起来，解出 SNI。
+//
+// 返回 (host, dcid, complete, err)：
+//   - complete=true 表示 SNI 已还原（来自 decoder 或 DNS 线索兜底）；
+//   - complete=false 且 err=nil 表示分片还没收齐，已暂存，等后续数据报；
+//   - err!=nil 表示无法接管（非 Initial / 未知版本 / 解密失败）。
+func (r *quicRelay) accumulate(addr *net.UDPAddr, pkt []byte) (string, []byte, bool, error) {
+	dcid := dcidOf(pkt)
+	if dcid == nil {
+		return "", nil, false, errNotInitial
+	}
+	key := cidKey(addr, dcid)
+
+	pv, _ := r.pending.LoadOrStore(key, newQuicPending())
+	p := pv.(*quicPending)
+	p.touch()
+	// run() 的 buf 会被下一轮复用，暂存前必须拷贝。
+	cp := make([]byte, len(pkt))
+	copy(cp, pkt)
+	p.buf = append(p.buf, cp)
+
+	host, ok, err := p.dec.Feed(cp)
+	if err != nil {
+		// 解析彻底失败（分片过多 / 结构异常）：尝试 DNS 线索兜底。
+		if h, hok := dnsHints.get(addr.IP); hok {
+			logf("debug", "QUIC %s Initial 解析失败(%v)，用 DoT 线索兜底为 %s", addr, err, h)
+			return h, dcid, true, nil
+		}
+		r.pending.Delete(key)
+		return "", nil, false, err
+	}
+	if !ok {
+		// 分片未收齐：只要没超过硬上限就继续暂存。超过后用线索兜底。
+		if p.dec.Packets() >= quicsni.MaxInitialPackets {
+			if h, hok := dnsHints.get(addr.IP); hok {
+				logf("debug", "QUIC %s 分片超限，用 DoT 线索兜底为 %s", addr, h)
+				return h, dcid, true, nil
+			}
+			r.pending.Delete(key)
+			return "", nil, false, errNoSNI
+		}
+		return "", nil, false, nil
+	}
+	return host, dcid, true, nil
+}
+
+// takePending 取出并删除拼接期间缓冲的原始包，交给刚建好的会话按序冲刷。
+func (r *quicRelay) takePending(addr *net.UDPAddr, dcid []byte) [][]byte {
+	key := cidKey(addr, dcid)
+	v, ok := r.pending.LoadAndDelete(key)
+	if !ok {
+		return nil
+	}
+	return v.(*quicPending).buf
 }
 
 // resolveCached 带短缓存的域名解析。QUIC 的每条会话都要知道目标地址，
@@ -552,141 +656,43 @@ func (r *quicRelay) gc() {
 			}
 			return true
 		})
+		// 暂存的分片若长时间拼不齐（客户端半路放弃），按 idle 回收，
+		// 否则每个半成品都占着 decoder + 原始包缓冲，攒多了就是内存泄漏。
+		r.pending.Range(func(k, v any) bool {
+			if now-v.(*quicPending).last.Load() > limit {
+				r.pending.Delete(k)
+			}
+			return true
+		})
 	}
 }
 
+// quicInitial 是单包解析的返回结构（多包拼接走 accumulate）。
 type quicInitial struct {
 	host string
 	dcid []byte
 }
 
-// parseInitial 解密 QUIC v1 Initial 包，取出 SNI 与目标连接 ID。
+// parseInitial 解出 QUIC Initial 的 SNI 与目标连接 ID（v1/v2/draft29）。
+// 单包解析；多包拼接走 quicRelay.accumulate。保留此函数供测试与工具调用。
 func parseInitial(pkt []byte) (*quicInitial, error) {
-	host, dcid, err := parseInitialParts(pkt)
+	host, err := parseQUICInitial(pkt)
 	if err != nil {
 		return nil, err
 	}
-	return &quicInitial{host: host, dcid: dcid}, nil
+	return &quicInitial{host: host, dcid: dcidOf(pkt)}, nil
 }
 
 // parseQUICInitial 只关心 SNI 的调用方用这个。
 func parseQUICInitial(pkt []byte) (string, error) {
-	host, _, err := parseInitialParts(pkt)
-	return host, err
-}
-
-func parseInitialParts(pkt []byte) (string, []byte, error) {
-	if len(pkt) < 40 || pkt[0]&0x80 == 0 {
-		return "", nil, errNotInitial
-	}
-	if binary.BigEndian.Uint32(pkt[1:5]) != 1 {
-		return "", nil, errNotInitial
-	}
-	// v1: 0x00 = Initial（低 4 位含 PN 长度，先不看）
-	if pkt[0]&0x30 != 0x00 {
-		return "", nil, errNotInitial
-	}
-	p := 5
-	dcidLen := int(pkt[p])
-	p++
-	if dcidLen < 1 || dcidLen > 20 || p+dcidLen > len(pkt) {
-		return "", nil, errNotInitial
-	}
-	dcid := pkt[p : p+dcidLen]
-	p += dcidLen
-	scidLen := int(pkt[p])
-	p++
-	if p+scidLen > len(pkt) {
-		return "", nil, errNotInitial
-	}
-	p += scidLen
-
-	tokenLen, n := readVarint(pkt[p:])
-	if n == 0 {
-		return "", nil, errNotInitial
-	}
-	p += n
-	if tokenLen > uint64(len(pkt)) || p+int(tokenLen) > len(pkt) {
-		return "", nil, errNotInitial
-	}
-	p += int(tokenLen)
-
-	length, n := readVarint(pkt[p:])
-	if n == 0 {
-		return "", nil, errNotInitial
-	}
-	p += n
-	end := p + int(length)
-	if end > len(pkt) {
-		end = len(pkt)
-	}
-	if p+4+16 > end {
-		return "", nil, errors.New("Initial 负载过短")
-	}
-
-	plain, err := decryptInitial(dcid, pkt, p, end)
+	host, ok, err := quicsni.NewDecoder().Feed(pkt)
 	if err != nil {
-		return "", nil, err
+		return "", err
 	}
-	hello, err := extractCryptoFrame(plain)
-	if err != nil {
-		return "", nil, err
+	if !ok {
+		return "", errNoSNI
 	}
-	host, err := parseClientHello(hello)
-	if err != nil {
-		return "", nil, fmt.Errorf("%w: %v", errNoSNI, err)
-	}
-	return host, dcid, nil
-}
-
-func decryptInitial(dcid, pkt []byte, pnOffset, end int) ([]byte, error) {
-	secret := hkdfExtract(quicV1Salt, dcid)
-	clientSecret := expandLabel(secret, "client in", 32)
-	key := expandLabel(clientSecret, "quic key", 16)
-	iv := expandLabel(clientSecret, "quic iv", 12)
-	hp := expandLabel(clientSecret, "quic hp", 16)
-
-	block, err := aes.NewCipher(hp)
-	if err != nil {
-		return nil, err
-	}
-	sample := pkt[pnOffset+4 : pnOffset+4+16]
-	mask := make([]byte, 16)
-	block.Encrypt(mask, sample)
-
-	buf := make([]byte, len(pkt))
-	copy(buf, pkt)
-	buf[0] ^= mask[0] & 0x0f
-	pnLen := int(buf[0]&0x03) + 1
-	if pnOffset+pnLen > end {
-		return nil, errors.New("PN 越界")
-	}
-	pn := [4]byte{}
-	for i := 0; i < pnLen; i++ {
-		buf[pnOffset+i] ^= mask[1+i]
-		pn[4-pnLen+i] = buf[pnOffset+i]
-	}
-
-	nonce := make([]byte, 12)
-	copy(nonce, iv)
-	for i := 0; i < 4; i++ {
-		nonce[len(nonce)-4+i] ^= pn[i]
-	}
-
-	aead, err := cipher.NewGCM(mustAES(key))
-	if err != nil {
-		return nil, err
-	}
-	aad := buf[:pnOffset+pnLen]
-	ct := buf[pnOffset+pnLen : end]
-	if len(ct) < aead.Overhead() {
-		return nil, errors.New("密文过短")
-	}
-	plain, err := aead.Open(nil, nonce, ct, aad)
-	if err != nil {
-		return nil, fmt.Errorf("Initial 解密失败（可能不是 v1 或密钥不匹配）: %w", err)
-	}
-	return plain, nil
+	return host, nil
 }
 
 func mustAES(key []byte) cipher.Block {

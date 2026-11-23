@@ -234,6 +234,7 @@ func (s *dnsSvc) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 			return
 		case ActionProxy:
 			s.replyA(w, req, q, s.gatewayV4, s.cfg.SyntheticTTL)
+			dnsHints.put(src, name)
 			return
 		}
 		// final == ActionUnknown：解析失败，回退到域名规则的动作
@@ -243,6 +244,7 @@ func (s *dnsSvc) ServeDNS(w dns.ResponseWriter, req *dns.Msg) {
 	case ActionProxy:
 		// 返回网关地址，客户端把流量交给 443/80 的 SNI 转发
 		s.replyA(w, req, q, s.gatewayV4, s.cfg.SyntheticTTL)
+		dnsHints.put(src, name)
 		return
 	default:
 		s.forward(w, req, s.ecs)
